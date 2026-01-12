@@ -1,0 +1,20 @@
+{
+  "analysis_timestamp": "2026-01-10T16:00:55.723987+00:00",
+  "asset_id": "24918067747661759048720135607687934209172945708698786072564741153847301974566",
+  "market_summary": {
+    "total_price_points": 60,
+    "total_trades_analyzed": 15,
+    "cliff_timestamp": "2026-01-03T07:00:15+00:00",
+    "cliff_price_change_pct": 336.3636363636364
+  },
+  "pre_cliff_trades": {
+    "window_hours": 12,
+    "min_trade_size_usdc": 5000,
+    "total_suspicious_wallets": 0
+  },
+  "threshold_analysis": {
+    "error": "No suspects analyzed"
+  },
+  "suspect_wallets": [],
+  "top_3_most_profitable": []
+}
