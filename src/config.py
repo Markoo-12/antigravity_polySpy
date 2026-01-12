@@ -89,7 +89,7 @@ BRIDGE_CONTRACTS = {
 }
 
 # Insider Score Thresholds
-INSIDER_ALERT_THRESHOLD = 70  # Send alert if score >= this
+INSIDER_ALERT_THRESHOLD = 75  # Shadow-Whale: Send alert if score >= 75
 FORENSIC_USDC_THRESHOLD = float(os.getenv("FORENSIC_USDC_THRESHOLD", "10000"))  # Only analyze trades > this for insider
 BRIDGE_TIME_WINDOW_HOURS = 4  # Check for bridge txns within this window
 WIN_RATE_THRESHOLD = 0.75  # 75% win rate threshold
@@ -138,3 +138,41 @@ CLUSTER_MIN_SCORE = 70  # Minimum insider score for cluster participants
 
 # Data Retention (automatic cleanup)
 DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", "30"))  # Keep trades for 30 days
+
+# =============================================================================
+# SCORING V2.0 / SHADOW-WHALE CONFIGURATION
+# =============================================================================
+
+# Coordination Detection (Sybil Cluster)
+COORDINATION_WINDOW_MINUTES = 30  # Shadow-Whale: 30 min rolling window
+COORDINATION_FACTOR = 1.5  # Multiplier when Sybil cluster detected
+MIN_CLUSTER_WALLETS = 3  # Minimum wallets to trigger cluster
+
+# Execution Cluster (Immediate Alert)
+EXECUTION_CLUSTER_WINDOW_SECONDS = 120  # 2 minutes for coordinated strike
+EXECUTION_CLUSTER_MIN_WALLETS = 3  # 3+ wallets = immediate alert
+
+# Wallet Age Decay
+WALLET_AGE_DECAY_RATE = 7  # Points lost per day (Score = 50 - Days × 7)
+WALLET_AGE_MAX_DAYS = 7  # After this, wallet age score = 0
+
+# Round Number Detection
+ROUND_NUMBER_SCORE = 15  # Points for trades that are multiples of 1000
+
+# Binary Concentration
+BINARY_CONCENTRATION_SCORE = 25  # 100% of balance in single asset
+
+# Alpha Gap Guard (Execution Filter)
+ALPHA_GAP_MAX_CENTS = 0.05  # Discard if insider's price vs current > 5 cents
+
+# Late-Stage Divergence (adjusted for Shadow-Whale)
+LATE_STAGE_TRADE_MIN_SW = 5000  # $5k minimum for late-stage (was $20k)
+LATE_STAGE_SCORE_BONUS_SW = 30  # +30 pts for late-stage (was +60)
+
+# Signal Validation (Backtest)
+SIGNAL_VALIDATION_LOOKBACK_DAYS = 30  # Days to look back for validation
+PRICE_GAIN_THRESHOLD = 0.10  # 10% gain = true positive for buys
+PRICE_DECLINE_THRESHOLD = -0.05  # 5% decline = true positive for sells
+VALIDATION_WINDOW_HOURS = 24  # Check price N hours after trade
+
+
