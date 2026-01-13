@@ -178,16 +178,19 @@ class InsiderSentinel:
             print(f"   [WARN] Error resolving owner ({e}), using proxy address")
         
         # Phase 3, 4 & 5: Forensic analysis with Profit-Logic Layer
-        if trade.amount_usdc >= FORENSIC_USDC_THRESHOLD and owner_address and self.scorer:
+        # Run analysis if we have owner OR proxy address (proxy works as fallback)
+        if trade.amount_usdc >= FORENSIC_USDC_THRESHOLD and self.scorer:
             try:
                 print(f"   [ANALYSIS] Running forensic analysis...")
                 
                 # Calculate base insider score
+                # Pass proxy_address as fallback for wallet analysis when owner is unknown
                 score_result = await self.scorer.calculate_score(
                     owner_address=owner_address,
                     trade_timestamp=trade.timestamp,
                     trade_amount_usdc=trade.amount_usdc,
                     asset_id=trade.asset_id,
+                    proxy_address=trade.proxy_address,  # NEW: fallback for wallet analysis
                 )
                 
                 total_score = score_result.score

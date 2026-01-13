@@ -46,7 +46,7 @@ class MagicResolver:
             # Fallback: try reading from storage slot
             return await self._read_owner_from_storage(proxy_address)
         except Exception as e:
-            print(f"⚠️ Error resolving Magic proxy owner for {proxy_address}: {e}")
+            print(f"[WARN] Error resolving Magic proxy owner for {proxy_address}: {e}")
             return await self._read_owner_from_storage(proxy_address)
     
     async def _read_owner_from_storage(self, proxy_address: str) -> Optional[str]:
@@ -74,5 +74,5 @@ class MagicResolver:
             return None
             
         except Exception as e:
-            print(f"⚠️ Error reading storage for {proxy_address}: {e}")
+            print(f"[WARN] Error reading storage for {proxy_address}: {e}")
             return None

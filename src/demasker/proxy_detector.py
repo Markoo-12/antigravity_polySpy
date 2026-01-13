@@ -63,7 +63,7 @@ class ProxyDetector:
             return ProxyType.UNKNOWN
             
         except Exception as e:
-            print(f"⚠️ Error detecting proxy type for {address}: {e}")
+            print(f"[WARN] Error detecting proxy type for {address}: {e}")
             return ProxyType.UNKNOWN
     
     async def _get_code(self, address: str) -> bytes:

@@ -34,6 +34,7 @@ FEATURE_WEIGHTS: Dict[str, float] = {
     "maduro_rule": 1.0,         # 30 points max
     "round_number": 1.0,        # 15 points max
     "binary_concentration": 1.0, # 25 points max (Shadow-Whale)
+    "whale_trade": 1.0,         # 10-20 points based on size (NEW)
 }
 
 
@@ -106,6 +107,7 @@ class InsiderScorer:
         trade_timestamp: datetime,
         trade_amount_usdc: float,
         asset_id: str,
+        proxy_address: Optional[str] = None,  # NEW: fallback for wallet analysis
     ) -> InsiderScoreResult:
         """
         Calculate the insider probability score for a trade.
@@ -117,6 +119,7 @@ class InsiderScorer:
             trade_timestamp: When the trade occurred
             trade_amount_usdc: Trade size in USDC
             asset_id: The outcome token asset ID
+            proxy_address: The proxy wallet (used as fallback if owner unknown)
             
         Returns:
             InsiderScoreResult with complete analysis
@@ -156,9 +159,11 @@ class InsiderScorer:
         
         # =====================================================================
         # FEATURE 2: Win Rate (+30)
+        # Note: ERC-1155 tokens are held by proxy, not owner, so use proxy_address
         # =====================================================================
+        win_rate_address = proxy_address or owner_address
         win_rate_result = await self.win_rate_analyzer.calculate_win_rate(
-            owner_address,
+            win_rate_address,
             lookback_days=30,
         )
         if win_rate_result.score_points > 0:
@@ -184,15 +189,63 @@ class InsiderScorer:
             )
         
         # =====================================================================
+        # FEATURE 3.5: Whale Trade Size Bonus (+10/+15/+20)
+        # =====================================================================
+        # Works without owner resolution - based on trade amount only
+        whale_bonus = self._calculate_whale_bonus(trade_amount_usdc)
+        if whale_bonus > 0:
+            weighted_score = int(whale_bonus * self.weights.get("whale_trade", 1.0))
+            feature_scores["whale_trade"] = weighted_score
+            reasons.append(
+                f"Whale trade (${trade_amount_usdc:,.0f}) [+{weighted_score}]"
+            )
+        
+        # =====================================================================
+        # FEATURE 3.6: Round Number Detection (works without owner)
+        # =====================================================================
+        if self._is_round_number(trade_amount_usdc):
+            base_score = 15
+            weighted_score = int(base_score * self.weights.get("round_number", 1.0))
+            feature_scores["round_number"] = weighted_score
+            reasons.append(
+                f"Round number trade (${trade_amount_usdc:,.0f}) [+{weighted_score}]"
+            )
+        
+        # =====================================================================
         # FEATURE 4-7: Wallet Analysis (for trades >= threshold)
         # =====================================================================
+        # Use owner_address if available, otherwise fall back to proxy_address
+        analysis_address = owner_address or proxy_address
+        
         if trade_amount_usdc >= self.FULL_ANALYSIS_THRESHOLD:
-            wallet_result = await self.wallet_analyzer.analyze_wallet(
-                wallet_address=owner_address,
-                trade_timestamp=trade_timestamp,
-                current_asset_id=asset_id,
-                trade_amount_usdc=trade_amount_usdc,  # NEW: for round number check
-            )
+            # First try owner address if available
+            analysis_address = owner_address or proxy_address
+            
+            if analysis_address:
+                wallet_result = await self.wallet_analyzer.analyze_wallet(
+                    wallet_address=analysis_address,
+                    trade_timestamp=trade_timestamp,
+                    current_asset_id=asset_id,
+                    trade_amount_usdc=trade_amount_usdc,
+                )
+                
+                # Check for Infrastructure/Factory owner (excessive transactions)
+                # If owner has >50k txns, it's likely a factory, exchange, or massive bot.
+                # In this case, the specific proxy behavior is more relevant than the owner's.
+                if (wallet_result.total_transactions > 50_000 and 
+                    owner_address and 
+                    proxy_address and 
+                    analysis_address == owner_address):
+                    
+                    print(f"   [INFO] Owner has {wallet_result.total_transactions:,} txns (Likely Infrastructure). Switching to proxy analysis.")
+                    
+                    # Re-run analysis on the proxy itself
+                    wallet_result = await self.wallet_analyzer.analyze_wallet(
+                        wallet_address=proxy_address,
+                        trade_timestamp=trade_timestamp,
+                        current_asset_id=asset_id,
+                        trade_amount_usdc=trade_amount_usdc,
+                    )
             
             # Feature 4: New Wallet (with linear decay)
             if wallet_result.is_new_wallet and wallet_result.wallet_age_score > 0:
@@ -220,14 +273,8 @@ class InsiderScorer:
                     f"Single-market whale (Maduro Rule) [+{weighted_score}]"
                 )
             
-            # Feature 7: Round Number
-            if wallet_result.is_round_number:
-                base_score = 15  # SCORE_ROUND_NUMBER
-                weighted_score = int(base_score * self.weights.get("round_number", 1.0))
-                feature_scores["round_number"] = weighted_score
-                reasons.append(
-                    f"Round number trade (${trade_amount_usdc:,.0f}) [+{weighted_score}]"
-                )
+            # Feature 7: Round Number - MOVED to run before wallet analysis
+            # (Now runs even without owner resolution)
             
             # Feature 8: Binary Concentration (+25 pts)
             if wallet_result.is_binary_concentration:
@@ -302,6 +349,29 @@ class InsiderScorer:
             lines.append("No flags triggered")
         
         return "\n".join(lines)
+    
+    def _calculate_whale_bonus(self, trade_amount_usdc: float) -> int:
+        """
+        Calculate whale trade bonus based on trade size.
+        Uses halved values as per user request.
+        
+        Returns:
+            Bonus points: +10 ($50k-$100k), +15 ($100k-$200k), +20 ($200k+)
+        """
+        if trade_amount_usdc >= 200_000:
+            return 20
+        elif trade_amount_usdc >= 100_000:
+            return 15
+        elif trade_amount_usdc >= 50_000:
+            return 10
+        return 0
+    
+    def _is_round_number(self, amount: float) -> bool:
+        """
+        Check if trade amount is a round number.
+        Round = divisible by 1000 with no remainder.
+        """
+        return amount >= 10_000 and (amount % 1000) < 1  # Allow for floating point
     
     def update_weights(self, new_weights: Dict[str, float]) -> None:
         """

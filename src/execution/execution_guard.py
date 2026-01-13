@@ -15,7 +15,10 @@ from ..config import (
     MONITOR_DURATION_MINUTES,
     DUMP_THRESHOLD_PERCENT,
     MONITOR_CHECK_INTERVAL,
-    MORALIS_API_KEY,
+    POLYGONSCAN_API_KEY,
+    POLYGONSCAN_BASE_URL,
+    POLYGON_CHAIN_ID,
+    CTF_EXCHANGE_ADDRESS,
 )
 
 
@@ -200,41 +203,47 @@ class ExecutionGuard:
         """
         Get current share balance for a wallet/asset.
         
-        Uses Moralis NFT API since Polymarket positions are ERC1155 tokens.
+        Uses PolygonScan API to get ERC-1155 transfers and calculate balance.
         """
-        if not MORALIS_API_KEY:
+        if not POLYGONSCAN_API_KEY:
             return None
         
-        # Polymarket CTF contract
-        ctf_contract = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-        
-        url = f"https://deep-index.moralis.io/api/v2.2/{wallet_address}/nft"
         params = {
-            "chain": "polygon",
-            "token_addresses": [ctf_contract],
-        }
-        headers = {
-            "X-API-Key": MORALIS_API_KEY,
-            "accept": "application/json",
+            "chainid": POLYGON_CHAIN_ID,
+            "module": "account",
+            "action": "token1155tx",
+            "address": wallet_address,
+            "contractaddress": CTF_EXCHANGE_ADDRESS,
+            "page": 1,
+            "offset": 100,
+            "sort": "desc",
+            "apikey": POLYGONSCAN_API_KEY,
         }
         
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params, headers=headers, timeout=10) as resp:
+                async with session.get(POLYGONSCAN_BASE_URL, params=params, timeout=10) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         
-                        # Find the specific token
-                        for nft in data.get("result", []):
-                            if nft.get("token_id") == asset_id:
-                                return float(nft.get("amount", 0))
+                        if data.get("status") != "1" or not data.get("result"):
+                            return 0.0
                         
-                        # Not found = 0 shares
-                        return 0.0
+                        # Calculate net balance for the specific token
+                        balance = 0.0
+                        for tx in data["result"]:
+                            if tx.get("tokenID") == asset_id:
+                                value = float(tx.get("tokenValue", 0))
+                                if tx.get("to", "").lower() == wallet_address.lower():
+                                    balance += value
+                                elif tx.get("from", "").lower() == wallet_address.lower():
+                                    balance -= value
+                        
+                        return max(0.0, balance)
                     else:
                         return None
         except Exception as e:
-            print(f"[ERROR] Moralis NFT query failed: {e}")
+            print(f"[ERROR] PolygonScan NFT query failed: {e}")
             return None
     
     @property

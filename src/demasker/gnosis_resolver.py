@@ -44,8 +44,8 @@ class GnosisResolver:
             return None
             
         except ContractLogicError as e:
-            print(f"⚠️ Contract error resolving Safe owner for {safe_address}: {e}")
+            print(f"[WARN] Contract error resolving Safe owner for {safe_address}: {e}")
             return None
         except Exception as e:
-            print(f"⚠️ Error resolving Safe owner for {safe_address}: {e}")
+            print(f"[WARN] Error resolving Safe owner for {safe_address}: {e}")
             return None

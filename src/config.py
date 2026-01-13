@@ -73,13 +73,15 @@ DATABASE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data",
 # PHASE 3 & 4 CONFIGURATION
 # =============================================================================
 
-# Moralis API
-MORALIS_API_KEY = os.getenv("MORALIS_API_KEY", "")
-MORALIS_BASE_URL = "https://deep-index.moralis.io/api/v2.2"
-
 # Telegram Bot
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# PolygonScan / Etherscan V2 API (replaces Moralis)
+# Uses unified Etherscan V2 endpoint with chainid=137 for Polygon
+POLYGONSCAN_API_KEY = os.getenv("POLYGONSCAN_API_KEY", "")
+POLYGONSCAN_BASE_URL = "https://api.etherscan.io/v2/api"
+POLYGON_CHAIN_ID = 137
 
 # Bridge Contract Addresses (Polygon)
 BRIDGE_CONTRACTS = {

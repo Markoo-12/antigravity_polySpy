@@ -1,40 +1,37 @@
 """
 Wallet Analyzer - Checks wallet age and activity patterns.
-Uses Moralis API to detect new wallets and single-market whales.
+Uses PolygonScan/Etherscan V2 API to detect new wallets and single-market whales.
 """
 import aiohttp
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 from dataclasses import dataclass
 
-from ..config import MORALIS_API_KEY, MORALIS_BASE_URL
+from ..config import (
+    POLYGONSCAN_API_KEY,
+    POLYGONSCAN_BASE_URL,
+    POLYGON_CHAIN_ID,
+    CTF_EXCHANGE_ADDRESS,
+)
 
 
 # Scoring constants
-SCORE_NEW_WALLET = 50  # Wallet < 7 days old (max, before decay)
-SCORE_LOW_TX_COUNT = 20  # Wallet < 10 transactions
+SCORE_NEW_WALLET = 50  # Wallet < 72 hours old = +50 flat
+SCORE_LOW_TX_COUNT = 20  # Wallet < 20 transactions
 SCORE_SINGLE_MARKET = 30  # 100% capital in one market (Maduro Rule)
 SCORE_ROUND_NUMBER = 15  # Trade amount is clean multiple of 1000/5000/10000
 SCORE_BINARY_CONCENTRATION = 25  # 100% of Polymarket balance in single asset
 
-# Wallet age decay configuration
-WALLET_AGE_DECAY_RATE = 7  # Points lost per day
-WALLET_AGE_MAX_DAYS = 7  # After this, score = 0
+# Wallet age threshold (Phase 2 spec: <72 hours)
+WALLET_AGE_MAX_HOURS = 72  # Wallets younger than this get full bonus
+WALLET_AGE_MAX_DAYS = 3.0  # 72 hours = 3 days
+
+# Low activity threshold (Phase 2 spec: <20 txns)
+LOW_ACTIVITY_THRESHOLD = 20  # Transactions below this = low activity
 
 
 def check_round_number(amount_usdc: float) -> bool:
-    """
-    Check if amount is a 'round' number (psychological bias indicator).
-    
-    Clean multiples of 1000, 5000, or 10000 suggest non-organic trading,
-    often seen in coordinated or insider activity.
-    
-    Args:
-        amount_usdc: The trade amount in USDC
-        
-    Returns:
-        True if amount is a clean multiple of 1000
-    """
+    """Check if amount is a 'round' number (psychological bias indicator)."""
     if amount_usdc <= 0:
         return False
     return amount_usdc % 1000 == 0
@@ -42,20 +39,14 @@ def check_round_number(amount_usdc: float) -> bool:
 
 def calculate_wallet_age_score(age_days: float) -> int:
     """
-    Calculate wallet age score with linear decay.
-    
-    Formula: Score = 50 - (AgeInDays × 7)
-    If Age > 7 days, score = 0.
-    
-    Args:
-        age_days: Wallet age in days
-        
-    Returns:
-        Score from 0 to 50
+    Calculate wallet age score.
+    Phase 2 Spec: If wallet < 72 hours old, +50 flat.
     """
-    if age_days is None or age_days > WALLET_AGE_MAX_DAYS:
+    if age_days is None:
         return 0
-    return max(0, int(SCORE_NEW_WALLET - (age_days * WALLET_AGE_DECAY_RATE)))
+    if age_days < WALLET_AGE_MAX_DAYS:
+        return SCORE_NEW_WALLET  # +50 flat
+    return 0
 
 
 @dataclass
@@ -63,11 +54,11 @@ class WalletAnalysisResult:
     """Result of wallet age and activity analysis."""
     first_tx_date: Optional[datetime] = None
     wallet_age_days: Optional[float] = None
-    is_new_wallet: bool = False  # < 7 days old
-    wallet_age_score: int = 0  # Decayed score based on age
+    is_new_wallet: bool = False  # < 72 hours old
+    wallet_age_score: int = 0
     
     total_transactions: int = 0
-    is_low_activity: bool = False  # < 10 transactions
+    is_low_activity: bool = False  # < 20 transactions
     
     is_single_market: bool = False  # Maduro Rule
     is_round_number: bool = False  # Round number bias
@@ -79,21 +70,19 @@ class WalletAnalysisResult:
 
 class WalletAnalyzer:
     """
-    Analyzes wallet age and activity patterns to detect suspicious new accounts.
+    Analyzes wallet age and activity patterns using PolygonScan API.
     
     Checks:
-    1. Wallet age (< 7 days = up to +50 points with linear decay)
-    2. Transaction count (< 10 txns = +20 points)
+    1. Wallet age (< 72 hours = +50 points)
+    2. Transaction count (< 20 txns = +20 points)
     3. Single-market concentration (Maduro Rule = +30 points)
     4. Round number trades (multiples of 1000 = +15 points)
     """
     
-    def __init__(self, api_key: str = MORALIS_API_KEY):
-        self.api_key = api_key
-        self.headers = {
-            "Accept": "application/json",
-            "X-API-Key": api_key,
-        }
+    def __init__(self):
+        self.api_key = POLYGONSCAN_API_KEY
+        self.base_url = POLYGONSCAN_BASE_URL
+        self.chain_id = POLYGON_CHAIN_ID
     
     async def analyze_wallet(
         self,
@@ -104,73 +93,47 @@ class WalletAnalyzer:
     ) -> WalletAnalysisResult:
         """
         Analyze wallet for new wallet / single-market patterns.
-        
-        Args:
-            wallet_address: The wallet address to analyze
-            trade_timestamp: When the trade occurred (for age calculation)
-            current_asset_id: The asset being traded (for Maduro Rule)
-            trade_amount_usdc: Trade amount for round number detection
-            
-        Returns:
-            WalletAnalysisResult with scoring
         """
         result = WalletAnalysisResult()
         score = 0
         notes = []
         
         if not self.api_key:
-            result.analysis_note = "Moralis API key not configured"
+            result.analysis_note = "PolygonScan API key not configured"
             return result
         
-        # Get wallet's first transaction date and activity
         try:
-            chain_data = await self._get_wallet_active_chains(wallet_address)
+            # Get first transaction and transaction count
+            tx_data = await self._get_wallet_transactions(wallet_address)
             
-            if chain_data:
-                # Find Polygon chain data
-                polygon_data = None
-                for chain in chain_data.get("active_chains", []):
-                    if chain.get("chain") == "polygon":
-                        polygon_data = chain
-                        break
-                
-                if polygon_data:
-                    # Get first transaction date
-                    first_tx = polygon_data.get("first_transaction", {})
-                    first_tx_timestamp = first_tx.get("block_timestamp")
+            if tx_data:
+                # Calculate wallet age from first transaction
+                if tx_data.get("first_tx_timestamp"):
+                    first_tx_ts = int(tx_data["first_tx_timestamp"])
+                    result.first_tx_date = datetime.fromtimestamp(first_tx_ts, tz=timezone.utc)
                     
-                    if first_tx_timestamp:
-                        # Parse ISO format timestamp
-                        result.first_tx_date = datetime.fromisoformat(
-                            first_tx_timestamp.replace("Z", "+00:00")
-                        )
-                        
-                        # Calculate wallet age
-                        ref_time = trade_timestamp or datetime.now(timezone.utc)
-                        if ref_time.tzinfo is None:
-                            ref_time = ref_time.replace(tzinfo=timezone.utc)
-                        
-                        age = ref_time - result.first_tx_date
-                        result.wallet_age_days = age.total_seconds() / 86400
-                        
-                        # Check if new wallet (< 7 days) - use linear decay
-                        if result.wallet_age_days < WALLET_AGE_MAX_DAYS:
-                            result.is_new_wallet = True
-                            # Apply linear decay: Score = 50 - (Days × 7)
-                            age_score = calculate_wallet_age_score(result.wallet_age_days)
-                            result.wallet_age_score = age_score
-                            score += age_score
-                            notes.append(f"New wallet ({result.wallet_age_days:.1f} days old) [+{age_score}]")
-            
-            # Get transaction count
-            tx_stats = await self._get_wallet_stats(wallet_address)
-            if tx_stats:
-                result.total_transactions = tx_stats.get("transactions", {}).get("total", 0)
+                    ref_time = trade_timestamp or datetime.now(timezone.utc)
+                    if ref_time.tzinfo is None:
+                        ref_time = ref_time.replace(tzinfo=timezone.utc)
+                    
+                    age = ref_time - result.first_tx_date
+                    result.wallet_age_days = age.total_seconds() / 86400
+                    
+                    # Check if new wallet (< 72 hours)
+                    if result.wallet_age_days < WALLET_AGE_MAX_DAYS:
+                        result.is_new_wallet = True
+                        age_score = calculate_wallet_age_score(result.wallet_age_days)
+                        result.wallet_age_score = age_score
+                        score += age_score
+                        notes.append(f"New wallet ({result.wallet_age_days:.1f} days old) [+{age_score}]")
                 
-                if result.total_transactions < 10:
+                # Transaction count
+                result.total_transactions = tx_data.get("tx_count", 0)
+                
+                if result.total_transactions < LOW_ACTIVITY_THRESHOLD:
                     result.is_low_activity = True
                     score += SCORE_LOW_TX_COUNT
-                    notes.append(f"Low activity ({result.total_transactions} txns) [+{SCORE_LOW_TX_COUNT}]")
+                    notes.append(f"Low activity ({result.total_transactions} txns < {LOW_ACTIVITY_THRESHOLD}) [+{SCORE_LOW_TX_COUNT}]")
             
             # Check for single-market concentration (Maduro Rule)
             if current_asset_id:
@@ -180,14 +143,13 @@ class WalletAnalyzer:
                     score += SCORE_SINGLE_MARKET
                     notes.append(f"Single-market whale (Maduro Rule) [+{SCORE_SINGLE_MARKET}]")
             
-            # Check for round number trades (+15 points)
+            # Check for round number trades
             if trade_amount_usdc and check_round_number(trade_amount_usdc):
                 result.is_round_number = True
                 score += SCORE_ROUND_NUMBER
                 notes.append(f"Round number trade (${trade_amount_usdc:,.0f}) [+{SCORE_ROUND_NUMBER}]")
             
-            # Check for binary concentration (+25 points)
-            # 100% of Polymarket balance in single asset
+            # Check for binary concentration
             if current_asset_id:
                 is_binary = await self._check_binary_concentration(wallet_address, current_asset_id)
                 if is_binary:
@@ -199,46 +161,66 @@ class WalletAnalyzer:
             notes.append(f"Analysis error: {str(e)[:50]}")
         
         result.score_points = score
-        result.analysis_note = "; ".join(notes) if notes else "No new wallet flags"
+        result.analysis_note = "; ".join(notes) if notes else "No wallet flags"
         
         return result
     
-    async def _get_wallet_active_chains(self, wallet_address: str) -> Optional[dict]:
+    async def _get_wallet_transactions(self, wallet_address: str) -> Optional[dict]:
         """
-        Get wallet's active chains with first transaction dates.
-        Uses Moralis getWalletActiveChains endpoint.
+        Get wallet's first transaction and transaction count using PolygonScan.
         """
-        url = f"{MORALIS_BASE_URL}/wallets/{wallet_address}/chains"
-        
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=self.headers) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    else:
-                        error = await resp.text()
-                        print(f"[WALLET] Moralis chains error: {resp.status}")
+                # Get first transaction (sorted ascending)
+                params = {
+                    "chainid": self.chain_id,
+                    "module": "account",
+                    "action": "txlist",
+                    "address": wallet_address,
+                    "startblock": 0,
+                    "endblock": 99999999,
+                    "page": 1,
+                    "offset": 1,  # Just get first tx
+                    "sort": "asc",
+                    "apikey": self.api_key,
+                }
+                
+                async with session.get(self.base_url, params=params, timeout=10) as resp:
+                    if resp.status != 200:
                         return None
-        except Exception as e:
-            print(f"[WALLET] API error: {e}")
-            return None
-    
-    async def _get_wallet_stats(self, wallet_address: str) -> Optional[dict]:
-        """
-        Get wallet statistics including transaction count.
-        Uses Moralis getWalletStats endpoint.
-        """
-        url = f"{MORALIS_BASE_URL}/wallets/{wallet_address}/stats"
-        params = {"chain": "polygon"}
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=self.headers, params=params) as resp:
+                    
+                    data = await resp.json()
+                    first_tx_timestamp = None
+                    
+                    if data.get("status") == "1" and data.get("result"):
+                        first_tx = data["result"][0]
+                        first_tx_timestamp = first_tx.get("timeStamp")
+                
+                # Get total transaction count
+                params_count = {
+                    "chainid": self.chain_id,
+                    "module": "proxy",
+                    "action": "eth_getTransactionCount",
+                    "address": wallet_address,
+                    "tag": "latest",
+                    "apikey": self.api_key,
+                }
+                
+                async with session.get(self.base_url, params=params_count, timeout=10) as resp:
+                    tx_count = 0
                     if resp.status == 200:
-                        return await resp.json()
-                    return None
+                        data = await resp.json()
+                        if data.get("result"):
+                            # Convert hex to int
+                            tx_count = int(data["result"], 16)
+                
+                return {
+                    "first_tx_timestamp": first_tx_timestamp,
+                    "tx_count": tx_count,
+                }
+        
         except Exception as e:
-            print(f"[WALLET] Stats error: {e}")
+            print(f"[WARN] PolygonScan wallet lookup error: {e}")
             return None
     
     async def _check_single_market(
@@ -248,45 +230,46 @@ class WalletAnalyzer:
     ) -> bool:
         """
         Check if wallet only trades in a single market (Maduro Rule).
-        Looks at ERC-1155 holdings to see if all positions are in one asset.
+        Uses ERC-1155 transfer events to CTF contract.
         """
-        url = f"{MORALIS_BASE_URL}/{wallet_address}/nft"
-        params = {
-            "chain": "polygon",
-            "format": "decimal",
-            "token_addresses": ["0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"],  # CTF token
-            "limit": 50
-        }
-        
         try:
+            params = {
+                "chainid": self.chain_id,
+                "module": "account",
+                "action": "token1155tx",  # ERC-1155 transfers
+                "address": wallet_address,
+                "contractaddress": CTF_EXCHANGE_ADDRESS,
+                "page": 1,
+                "offset": 50,
+                "sort": "desc",
+                "apikey": self.api_key,
+            }
+            
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=self.headers, params=params) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        nfts = data.get("result", [])
-                        
-                        if not nfts:
-                            return False
-                        
-                        # Get unique token IDs (asset IDs)
-                        asset_ids = set()
-                        for nft in nfts:
-                            token_id = nft.get("token_id")
-                            if token_id:
-                                asset_ids.add(token_id)
-                        
-                        # Maduro Rule: Only one asset ID
-                        if len(asset_ids) == 1 and current_asset_id in asset_ids:
-                            return True
-                        
-                        # Also flag if current asset is >90% of holdings
-                        if len(asset_ids) <= 2:
-                            return True
-                        
+                async with session.get(self.base_url, params=params, timeout=10) as resp:
+                    if resp.status != 200:
                         return False
+                    
+                    data = await resp.json()
+                    
+                    if data.get("status") == "1" and data.get("result"):
+                        transfers = data["result"]
+                        
+                        # Get unique token IDs
+                        token_ids = set()
+                        for tx in transfers:
+                            token_id = tx.get("tokenID")
+                            if token_id:
+                                token_ids.add(token_id)
+                        
+                        # Maduro Rule: Only 1-2 token IDs and current is one of them
+                        if len(token_ids) <= 2 and current_asset_id in token_ids:
+                            return True
+                    
                     return False
+        
         except Exception as e:
-            print(f"[WALLET] Single market check error: {e}")
+            print(f"[WARN] Single market check error: {e}")
             return False
     
     async def _check_binary_concentration(
@@ -296,46 +279,54 @@ class WalletAnalyzer:
     ) -> bool:
         """
         Check if wallet has 100% of Polymarket balance in a single asset.
-        
-        This is stricter than Maduro Rule - requires exactly 1 holding.
-        
-        Returns:
-            True if wallet has only one ERC-1155 position
         """
-        url = f"{MORALIS_BASE_URL}/{wallet_address}/nft"
-        params = {
-            "chain": "polygon",
-            "format": "decimal",
-            "token_addresses": ["0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"],  # CTF token
-            "limit": 50
-        }
-        
         try:
+            params = {
+                "chainid": self.chain_id,
+                "module": "account",
+                "action": "token1155tx",
+                "address": wallet_address,
+                "contractaddress": CTF_EXCHANGE_ADDRESS,
+                "page": 1,
+                "offset": 50,
+                "sort": "desc",
+                "apikey": self.api_key,
+            }
+            
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=self.headers, params=params) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        nfts = data.get("result", [])
-                        
-                        if not nfts:
-                            return False
-                        
-                        # Get unique token IDs with non-zero balance
-                        asset_ids = set()
-                        for nft in nfts:
-                            token_id = nft.get("token_id")
-                            amount = nft.get("amount", "0")
-                            # Only count if has balance
-                            if token_id and int(amount) > 0:
-                                asset_ids.add(token_id)
-                        
-                        # Binary concentration: exactly 1 asset AND it's the current one
-                        if len(asset_ids) == 1 and current_asset_id in asset_ids:
-                            return True
-                        
+                async with session.get(self.base_url, params=params, timeout=10) as resp:
+                    if resp.status != 200:
                         return False
+                    
+                    data = await resp.json()
+                    
+                    if data.get("status") == "1" and data.get("result"):
+                        transfers = data["result"]
+                        
+                        # Calculate net holdings per token
+                        holdings = {}
+                        for tx in transfers:
+                            token_id = tx.get("tokenID")
+                            value = int(tx.get("tokenValue", 0))
+                            to_addr = tx.get("to", "").lower()
+                            
+                            if token_id not in holdings:
+                                holdings[token_id] = 0
+                            
+                            if to_addr == wallet_address.lower():
+                                holdings[token_id] += value
+                            else:
+                                holdings[token_id] -= value
+                        
+                        # Filter to positive holdings
+                        active_holdings = {k: v for k, v in holdings.items() if v > 0}
+                        
+                        # Binary concentration: exactly 1 active holding
+                        if len(active_holdings) == 1 and current_asset_id in active_holdings:
+                            return True
+                    
                     return False
+        
         except Exception as e:
-            print(f"[WALLET] Binary concentration check error: {e}")
+            print(f"[WARN] Binary concentration check error: {e}")
             return False
-

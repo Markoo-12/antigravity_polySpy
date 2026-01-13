@@ -1,15 +1,16 @@
 """
 Win rate analyzer for Polymarket wallets.
-Calculates historical win rate on positions using Moralis API.
+Calculates historical win rate on positions using PolygonScan API.
 """
 import aiohttp
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from dataclasses import dataclass
 
 from ..config import (
-    MORALIS_API_KEY,
-    MORALIS_BASE_URL,
+    POLYGONSCAN_API_KEY,
+    POLYGONSCAN_BASE_URL,
+    POLYGON_CHAIN_ID,
     WIN_RATE_THRESHOLD,
     WIN_RATE_POSITION_MIN,
     SCORE_HIGH_WIN_RATE,
@@ -31,11 +32,13 @@ class WinRateResult:
 class WinRateAnalyzer:
     """
     Analyzes a wallet's historical win rate on Polymarket positions.
-    Uses ERC-1155 token transfers to track position exits.
+    Uses ERC-1155 token transfers via PolygonScan API.
     """
     
     def __init__(self):
-        pass
+        self.api_key = POLYGONSCAN_API_KEY
+        self.base_url = POLYGONSCAN_BASE_URL
+        self.chain_id = POLYGON_CHAIN_ID
     
     async def calculate_win_rate(
         self,
@@ -59,14 +62,14 @@ class WinRateAnalyzer:
         Returns:
             WinRateResult with analysis
         """
-        if not MORALIS_API_KEY:
+        if not self.api_key:
             return WinRateResult(
                 win_rate=None,
                 total_positions=0,
                 winning_positions=0,
                 total_volume_usdc=0,
                 score_points=0,
-                analysis_note="Moralis API key not configured",
+                analysis_note="PolygonScan API key not configured",
             )
         
         try:
@@ -84,27 +87,26 @@ class WinRateAnalyzer:
                 )
             
             # Analyze transfers to estimate win rate
-            # This is a heuristic: large outflows to CTF Exchange suggest position exits
-            cutoff_date = datetime.utcnow() - timedelta(days=lookback_days)
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=lookback_days)
             
             positions = {}
             total_volume = 0.0
             
             for transfer in transfers:
                 try:
-                    tx_time = datetime.fromisoformat(
-                        transfer.get("block_timestamp", "").replace("Z", "+00:00")
-                    ).replace(tzinfo=None)
-                except (ValueError, AttributeError):
+                    # PolygonScan returns Unix timestamp
+                    tx_timestamp = int(transfer.get("timeStamp", 0))
+                    tx_time = datetime.fromtimestamp(tx_timestamp, tz=timezone.utc)
+                except (ValueError, TypeError):
                     continue
                 
                 if tx_time < cutoff_date:
                     continue
                 
-                token_id = transfer.get("token_id", "")
-                amount = float(transfer.get("value", 0))
-                to_addr = transfer.get("to_address", "").lower()
-                from_addr = transfer.get("from_address", "").lower()
+                token_id = transfer.get("tokenID", "")
+                amount = float(transfer.get("tokenValue", 0))
+                to_addr = transfer.get("to", "").lower()
+                from_addr = transfer.get("from", "").lower()
                 
                 # Track token movements
                 if token_id not in positions:
@@ -122,8 +124,7 @@ class WinRateAnalyzer:
             for token_id, data in positions.items():
                 # Heuristic: if sent back to exchange (likely redemption), count as closed
                 if data["sent"] > 0:
-                    # If received USDC > initial position, likely a win
-                    # This is simplified - full analysis would need pricing data
+                    # If received > initial position, likely a win
                     if data["received"] > 0:
                         total_volume += data["received"] / 1e6  # USDC has 6 decimals
                         # Assume profitable if position was closed
@@ -157,7 +158,7 @@ class WinRateAnalyzer:
             )
             
         except Exception as e:
-            print(f"⚠️ Error calculating win rate: {e}")
+            print(f"[WARN] Error calculating win rate: {e}")
             return WinRateResult(
                 win_rate=None,
                 total_positions=0,
@@ -172,25 +173,30 @@ class WinRateAnalyzer:
         address: str,
         limit: int = 100
     ) -> list[dict]:
-        """Fetch ERC-1155 transfers for an address from Moralis."""
-        url = f"{MORALIS_BASE_URL}/{address}/nft/transfers"
-        headers = {
-            "accept": "application/json",
-            "X-API-Key": MORALIS_API_KEY,
-        }
+        """Fetch ERC-1155 transfers for an address from PolygonScan."""
         params = {
-            "chain": "polygon",
-            "limit": limit,
-            "format": "decimal",
-            "contract_addresses": [CTF_EXCHANGE_ADDRESS],
+            "chainid": self.chain_id,
+            "module": "account",
+            "action": "token1155tx",
+            "address": address,
+            "contractaddress": CTF_EXCHANGE_ADDRESS,
+            "page": 1,
+            "offset": limit,
+            "sort": "desc",
+            "apikey": self.api_key,
         }
         
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, params=params) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("result", [])
-                else:
-                    error = await resp.text()
-                    print(f"⚠️ Moralis NFT API error: {resp.status} - {error}")
-                    return []
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self.base_url, params=params, timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("status") == "1" and data.get("result"):
+                            return data["result"]
+                        return []
+                    else:
+                        print(f"[WARN] PolygonScan API error: {resp.status}")
+                        return []
+        except Exception as e:
+            print(f"[WARN] PolygonScan fetch error: {e}")
+            return []
