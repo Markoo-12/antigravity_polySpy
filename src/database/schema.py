@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS trades (
     asset_id TEXT NOT NULL,
     side TEXT NOT NULL CHECK(side IN ('buy', 'sell')),
     amount_usdc REAL NOT NULL,
+    price REAL,  -- Price per token in USDC
     market_id TEXT,
     -- Phase 3: Forensic Auditor fields
     insider_score INTEGER DEFAULT 0,
@@ -47,6 +48,9 @@ ALTER TABLE trades ADD COLUMN bridge_funded BOOLEAN DEFAULT 0;
 ALTER TABLE trades ADD COLUMN bridge_name TEXT;
 ALTER TABLE trades ADD COLUMN win_rate REAL;
 ALTER TABLE trades ADD COLUMN analyzed_at DATETIME;
+
+-- Phase 5.x: Add price column
+ALTER TABLE trades ADD COLUMN price REAL;
 """
 
 

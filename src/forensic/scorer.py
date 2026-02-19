@@ -88,16 +88,17 @@ class InsiderScorer:
     # Threshold for running full wallet analysis
     FULL_ANALYSIS_THRESHOLD = 10000  # $10k
     
-    def __init__(self, feature_weights: Optional[Dict[str, float]] = None):
+    def __init__(self, repository=None, feature_weights: Optional[Dict[str, float]] = None):
         """
-        Initialize scorer with optional custom feature weights.
+        Initialize scorer with repository and optional custom weights.
         
         Args:
+            repository: TradeRepository for historical checks (Drip Detection)
             feature_weights: Optional dict to override default weights
         """
         self.bridge_detector = BridgeDetector()
         self.win_rate_analyzer = WinRateAnalyzer()
-        self.velocity_analyzer = MarketVelocityAnalyzer()
+        self.velocity_analyzer = MarketVelocityAnalyzer(repository=repository)
         self.wallet_analyzer = WalletAnalyzer()
         self.weights = feature_weights or FEATURE_WEIGHTS.copy()
     
@@ -107,7 +108,10 @@ class InsiderScorer:
         trade_timestamp: datetime,
         trade_amount_usdc: float,
         asset_id: str,
-        proxy_address: Optional[str] = None,  # NEW: fallback for wallet analysis
+        price: Optional[float] = None,
+        slippage_percent: float = 0.0,
+        current_mid_price: Optional[float] = None,
+        proxy_address: Optional[str] = None,
     ) -> InsiderScoreResult:
         """
         Calculate the insider probability score for a trade.
@@ -119,7 +123,10 @@ class InsiderScorer:
             trade_timestamp: When the trade occurred
             trade_amount_usdc: Trade size in USDC
             asset_id: The outcome token asset ID
-            proxy_address: The proxy wallet (used as fallback if owner unknown)
+            price: Execution price (for Drip Detection)
+            slippage_percent: Slippage impact (for Slippage Penalty)
+            current_mid_price: Current market mid-price (for Slippage Insensitivity)
+            proxy_address: The proxy wallet (fallback)
             
         Returns:
             InsiderScoreResult with complete analysis
@@ -175,18 +182,41 @@ class InsiderScorer:
             )
         
         # =====================================================================
-        # FEATURE 3: Market Velocity / Quiet Accumulation (+30)
+        # FEATURE 3: Quiet Accumulation (Drip Detection) (+35)
         # =====================================================================
-        velocity_result = await self.velocity_analyzer.check_quiet_accumulation(
-            trade_amount_usdc,
-            asset_id,
-        )
-        if velocity_result.is_quiet_accumulation:
-            weighted_score = int(velocity_result.score_points * self.weights.get("quiet_accumulation", 1.0))
-            feature_scores["quiet_accumulation"] = weighted_score
-            reasons.append(
-                f"Quiet accumulation pattern detected [+{weighted_score}]"
+        # Uses owner or proxy (whichever is the entity aggregation point)
+        drip_address = owner_address or proxy_address
+        
+        if drip_address and price:
+            velocity_result = await self.velocity_analyzer.check_quiet_accumulation(
+                trade_amount_usdc,
+                asset_id,
+                price=price,
+                owner_address=drip_address
             )
+            if velocity_result.is_quiet_accumulation:
+                # Base score for Drip is 35 (hardcoded in analyzer, but we apply weight here)
+                # Actually analyzer returns score_points=35.
+                weighted_score = int(velocity_result.score_points * self.weights.get("quiet_accumulation", 1.0))
+                feature_scores["quiet_accumulation"] = weighted_score
+                reasons.append(
+                    f"{velocity_result.analysis_note} [+{weighted_score}]"
+                )
+        else:
+             velocity_result = None # Placeholder if check skipped
+
+        # =====================================================================
+        # FEATURE 3.1: Slippage Penalty (Loud Sniper) (Cap at +15)
+        # =====================================================================
+        # If slippage > 5%, it's a "Loud Sniper" or "Panic Buy".
+        # We cap the TOTAL score at 15 if this triggers.
+        # But here we just calculate the penalty or flag, and apply cap at the end?
+        # The prompt says "label it as 'Loud Sniper' and cap the score at +15".
+        
+        is_loud_sniper = False
+        if slippage_percent > 0.05: # 5%
+             is_loud_sniper = True
+             reasons.append(f"LOUD SNIPER: Slippage {slippage_percent:.1%} > 5% [Score Capped at 15]")
         
         # =====================================================================
         # FEATURE 3.5: Whale Trade Size Bonus (+10/+15/+20)
@@ -198,6 +228,35 @@ class InsiderScorer:
             feature_scores["whale_trade"] = weighted_score
             reasons.append(
                 f"Whale trade (${trade_amount_usdc:,.0f}) [+{weighted_score}]"
+            )
+        
+        # =====================================================================
+        # FEATURE 3.6: Slippage Insensitivity (+25)
+        # =====================================================================
+        # Detect traders who "sweep" the order book, paying significantly more
+        # than mid-price. Slippage = (TradePrice - MidPrice) / MidPrice.
+        # Condition: Slippage > 3% AND TradeValue > $5,000.
+        
+        if price and current_mid_price and current_mid_price > 0 and trade_amount_usdc >= 5000:
+            trade_slippage = (price - current_mid_price) / current_mid_price
+            if trade_slippage > 0.03:  # 3%
+                base_score = 25
+                feature_scores["slippage_insensitivity"] = base_score
+                reasons.append(
+                    f"Slippage Insensitivity: {trade_slippage:.1%} over mid-price [+{base_score}]"
+                )
+        
+        # =====================================================================
+        # FEATURE 3.7: Low-Probability Trigger (+40)
+        # =====================================================================
+        # Identify "Maduro-style" bets on unlikely outcomes.
+        # Condition: TradePrice < 0.20 (20 cents) AND TradeValue > $10,000.
+        
+        if price and price < 0.20 and trade_amount_usdc >= 10000:
+            base_score = 40
+            feature_scores["low_probability_trigger"] = base_score
+            reasons.append(
+                f"Low-Probability Trigger: {price*100:.0f}% implied prob bet [+{base_score}]"
             )
         
         # =====================================================================
@@ -306,6 +365,13 @@ class InsiderScorer:
                 f"SYBIL CLUSTER: {coordination_result.cluster_size} wallets in "
                 f"{coordination_result.time_window_minutes * 2} min window [×{coordination_factor}]"
             )
+        
+        # =====================================================================
+        # FINAL CAP: Slippage Penalty
+        # =====================================================================
+        if is_loud_sniper:
+            final_score = min(final_score, 15)
+            # Ensure reasons list makes it clear
         
         # Determine if alert-worthy
         is_alert_worthy = final_score >= INSIDER_ALERT_THRESHOLD

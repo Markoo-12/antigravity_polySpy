@@ -57,6 +57,21 @@ class ParsedOrderFilled:
         return str(self.maker_asset_id)
     
     @property
+    def price(self) -> float:
+        """
+        Calculate execution price (USDC per Token).
+        Returns 0.0 if token amount is 0.
+        """
+        if self.is_maker_usdc:
+            # Maker buys tokens with USDC
+            # Price = USDC / Tokens
+            return self.maker_amount / self.taker_amount if self.taker_amount > 0 else 0.0
+        else:
+            # Maker sells tokens for USDC
+            # Price = USDC / Tokens
+            return self.taker_amount / self.maker_amount if self.maker_amount > 0 else 0.0
+
+    @property
     def side(self) -> str:
         """
         Determine trade side from maker's perspective.

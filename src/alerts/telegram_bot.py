@@ -55,6 +55,18 @@ class DumpAlertData:
     tx_hash: str
 
 
+@dataclass
+class ConvictionAlertData:
+    """Data for a confirmed conviction alert (held > 20 mins)."""
+    wallet_address: str
+    asset_id: str
+    initial_shares: float
+    current_shares: float
+    trade_amount_usdc: float
+    minutes_held: int
+    tx_hash: str
+
+
 class TelegramAlertBot:
     """
     Sends formatted alerts to Telegram when insider activity is detected.
@@ -78,12 +90,6 @@ class TelegramAlertBot:
     async def send_alert(self, alert: AlertData) -> bool:
         """
         Send an insider alert to Telegram with execution button.
-        
-        Args:
-            alert: AlertData with trade and score info
-            
-        Returns:
-            True if sent successfully
         """
         if not self.is_configured():
             print("[WARN] Telegram bot not configured (missing token or chat_id)")
@@ -97,12 +103,6 @@ class TelegramAlertBot:
     async def send_cluster_alert(self, cluster: ClusterAlertData) -> bool:
         """
         Send a CONVICTION CLUSTER alert.
-        
-        Args:
-            cluster: ClusterAlertData with cluster info
-            
-        Returns:
-            True if sent successfully
         """
         if not self.is_configured():
             return False
@@ -115,18 +115,41 @@ class TelegramAlertBot:
     async def send_dump_warning(self, dump: DumpAlertData) -> bool:
         """
         Send a MANIPULATION WARNING alert.
-        
-        Args:
-            dump: DumpAlertData with dump detection info
-            
-        Returns:
-            True if sent successfully
         """
         if not self.is_configured():
             return False
         
         message = self._format_dump_warning(dump)
         return await self._send_message(message)
+
+    async def send_conviction_alert(self, conviction: ConvictionAlertData) -> bool:
+        """
+        Send a TRUE WHALE CONVICTION alert (held > 20 mins).
+        """
+        if not self.is_configured():
+            return False
+        
+        message = self._format_conviction_alert(conviction)
+        return await self._send_message(message)
+
+    def _format_conviction_alert(self, conviction: ConvictionAlertData) -> str:
+        """Format a conviction alert."""
+        message = f"""
+🚨💎 *TRUE WHALE - CONVICTION CONFIRMED*
+
+✅ Wallet held position for *{conviction.minutes_held} minutes* without selling!
+
+💰 *Amount:* ${conviction.trade_amount_usdc:,.2f} USDC
+📈 *Shares:* {conviction.current_shares:,.0f} (No sales detected)
+
+👛 *Wallet:* `{conviction.wallet_address[:8]}...{conviction.wallet_address[-6:]}`
+
+🎯 *Verdict:* INFORMED ACCUMULATOR. This is a high-quality signal.
+
+🔗 [View Transaction](https://polygonscan.com/tx/{conviction.tx_hash})
+"""
+        return message.strip()
+
     
     def _format_alert(self, alert: AlertData) -> str:
         """Format the standard insider alert message."""

@@ -50,20 +50,36 @@ class DumpAlert:
     tx_hash: str
 
 
+@dataclass
+class ConvictionAlert:
+    """Alert data when conviction is confirmed (held > 20 mins)."""
+    wallet_address: str
+    asset_id: str
+    initial_shares: float
+    current_shares: float
+    trade_amount_usdc: float
+    minutes_held: int
+    tx_hash: str
+
+
 class ExecutionGuard:
     """
     Monitors whale positions for dump activity after initial trade.
     
-    If a wallet sells >20% of their position within 60 minutes of buying,
-    sends a MANIPULATION WARNING alert.
+    - If a wallet sells >20% of their position within 60 minutes of buying, sends MANIPULATION WARNING.
+    - If a wallet holds usage > 20 minutes without selling, sends CONVICTION CONFIRMED.
     """
     
     def __init__(
         self,
+        repository,
         on_dump_detected: Optional[Callable[[DumpAlert], Awaitable[None]]] = None,
+        on_conviction_confirmed: Optional[Callable[[ConvictionAlert], Awaitable[None]]] = None,
     ):
+        self.repository = repository
         self.monitored_positions: Dict[str, MonitoredPosition] = {}
         self.on_dump_detected = on_dump_detected
+        self.on_conviction_confirmed = on_conviction_confirmed
         self._running = False
         self._monitor_task: Optional[asyncio.Task] = None
         
@@ -101,17 +117,25 @@ class ExecutionGuard:
     ) -> None:
         """
         Add a position to monitor.
-        
-        Args:
-            wallet_address: The whale's wallet address
-            asset_id: The outcome token ID
-            shares: Number of shares bought
-            trade_amount_usdc: Trade size in USDC
-            tx_hash: Transaction hash of the buy
         """
         key = f"{wallet_address}:{asset_id}"
         now = datetime.utcnow()
         
+        # Check if already monitoring (accumulation) - extend duration?
+        # For simple implementation, we overwrite or keep existing start time?
+        # If we overwrite, we reset the conviction timer.
+        # If we keep, we might alert too soon (based on first trade).
+        # User says "held its $3k+ position".
+        # Let's keep existing start time if exists to reward accumulation.
+        if key in self.monitored_positions:
+            # Update shares and amount, keep start time
+            existing = self.monitored_positions[key]
+            existing.initial_shares += shares
+            existing.trade_amount_usdc += trade_amount_usdc
+            existing.last_checked = now # Reset checked
+            print(f"[GUARD] Updating position {wallet_address[:10]}... total shares: {existing.initial_shares:,.0f}")
+            return
+
         self.monitored_positions[key] = MonitoredPosition(
             wallet_address=wallet_address,
             asset_id=asset_id,
@@ -137,7 +161,7 @@ class ExecutionGuard:
                 await asyncio.sleep(30)
     
     async def _check_all_positions(self) -> None:
-        """Check all monitored positions for dumps."""
+        """Check all monitored positions for dumps and conviction."""
         now = datetime.utcnow()
         expired_keys = []
         
@@ -158,36 +182,70 @@ class ExecutionGuard:
                     position.current_shares = current_shares
                     position.last_checked = now
                     
-                    # Calculate dump percentage
+                    # Calculate minutes since start
+                    minutes_after = int((now - position.monitor_start).total_seconds() / 60)
+
+                    # 1. CHECK FOR DUMP
                     if position.initial_shares > 0:
                         sold_shares = position.initial_shares - current_shares
-                        dump_percent = sold_shares / position.initial_shares
                         
-                        if dump_percent >= self.dump_threshold:
-                            position.dumped = True
-                            position.dump_percent = dump_percent
+                        # Only flag as dump if sold positive amount (balance decreased)
+                        if sold_shares > 0:
+                            dump_percent = sold_shares / position.initial_shares
                             
-                            # Calculate minutes since buy
-                            minutes_after = int((now - position.monitor_start).total_seconds() / 60)
+                            if dump_percent >= self.dump_threshold:
+                                position.dumped = True
+                                position.dump_percent = dump_percent
+                                
+                                alert = DumpAlert(
+                                    wallet_address=position.wallet_address,
+                                    asset_id=position.asset_id,
+                                    initial_shares=position.initial_shares,
+                                    sold_shares=sold_shares,
+                                    dump_percent=dump_percent,
+                                    minutes_after_buy=minutes_after,
+                                    tx_hash=position.tx_hash,
+                                )
+                                
+                                print(f"[ALERT] DUMP DETECTED: {position.wallet_address[:10]}... sold {dump_percent:.0%}")
+                                
+                                if self.on_dump_detected:
+                                    await self.on_dump_detected(alert)
+                                
+                                # Stop monitoring this position
+                                expired_keys.append(key)
+                                continue
+
+                    # 2. CHECK FOR CONVICTION (True Whale)
+                    # "Held position for more than 20 minutes without selling a single share"
+                    # "Only trigger ... if the wallet has held its $3,000+ position"
+                    if (minutes_after >= 20 and 
+                        not getattr(position, 'conviction_sent', False) and 
+                        not position.dumped and
+                        position.trade_amount_usdc >= 3000):
+                        
+                        # Ensure NO selling (current_shares >= initial_shares)
+                        # We allow >= because they might have accumulated more (buy)
+                        if current_shares >= position.initial_shares * 0.99: # Allow 1% wiggle room for rounding
                             
-                            alert = DumpAlert(
+                            print(f"[ALERT] CONVICTION CONFIRMED: {position.wallet_address[:10]}... held > 20m")
+                            
+                            # Mark as sent
+                            position.conviction_sent = True
+                            
+                            conviction = ConvictionAlert(
                                 wallet_address=position.wallet_address,
                                 asset_id=position.asset_id,
                                 initial_shares=position.initial_shares,
-                                sold_shares=sold_shares,
-                                dump_percent=dump_percent,
-                                minutes_after_buy=minutes_after,
+                                current_shares=current_shares,
+                                trade_amount_usdc=position.trade_amount_usdc,
+                                minutes_held=minutes_after,
                                 tx_hash=position.tx_hash,
                             )
                             
-                            print(f"[ALERT] DUMP DETECTED: {position.wallet_address[:10]}... sold {dump_percent:.0%}")
-                            
-                            if self.on_dump_detected:
-                                await self.on_dump_detected(alert)
-                            
-                            # Stop monitoring this position
-                            expired_keys.append(key)
-                            
+                            if self.on_conviction_confirmed:
+                                await self.on_conviction_confirmed(conviction)
+                                            
             except Exception as e:
                 print(f"[WARN] Failed to check position {key}: {e}")
         
@@ -250,3 +308,29 @@ class ExecutionGuard:
     def active_monitors(self) -> int:
         """Number of positions currently being monitored."""
         return len(self.monitored_positions)
+
+    async def validate_alert(self, wallet_address: str, asset_id: str) -> bool:
+        """
+        Validate if an alert should be sent.
+        Returns False if the wallet has a history of high-frequency flipping (<30 mins).
+        known as the "Maturity Filter".
+        """
+        is_flipper = await self.repository.check_flipping_activity(
+            wallet_address, 
+            asset_id, 
+            minutes=30
+        )
+        if is_flipper:
+             print(f"[GUARD] Silent Discard: {wallet_address[:10]}... detected as High-Frequency Flipper")
+             return False # Discard
+        return True
+
+    async def check_conviction(self, wallet_address: str, asset_id: str) -> bool:
+        """
+        Check if the position qualifies for a 'True Whale' Conviction Alert.
+        Requires holding the position for > 20 minutes (accumulation verification).
+        """
+        hold_minutes = await self.repository.get_position_hold_time(wallet_address, asset_id)
+        if hold_minutes > 20:
+            return True
+        return False

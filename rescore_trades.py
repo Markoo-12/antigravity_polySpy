@@ -1,12 +1,9 @@
 """
-Script to re-score 100 suspicious transactions using the new forensic system.
-Fetches recent trades > $10k, resolves owners (with factory detection),
-runs full forensic analysis (wallet age, activity, win rate, bridge),
-and updates the database with new scores.
+Script to re-score trades using the NEW forensic system.
+Tests: Slippage Insensitivity, Low-Probability Trigger, Drip Detection.
 """
 import asyncio
 import sqlite3
-import json
 from datetime import datetime, timezone
 
 from web3 import AsyncWeb3
@@ -16,42 +13,50 @@ from src.config import POLYGON_HTTP_URL, FORENSIC_USDC_THRESHOLD, DATABASE_PATH
 from src.demasker import AddressResolver
 from src.forensic.scorer import InsiderScorer
 from src.database.repository import TradeRepository
+from src.execution import UpsideValidator
 
 
 async def main():
     print("=" * 70)
-    print("RE-SCORING SUSPICIOUS TRANSACTIONS")
+    print("RE-SCORING TRADES WITH NEW HEURISTICS")
+    print("  - Slippage Insensitivity (+25)")
+    print("  - Low-Probability Trigger (+40)")
+    print("  - Drip Detection (+35)")
     print("=" * 70)
     
     # 1. Fetch trades directly from DB
-    print(f"Fetching 100 recent trades above ${FORENSIC_USDC_THRESHOLD:,.0f}...")
+    print(f"\nFetching 50 recent trades above ${FORENSIC_USDC_THRESHOLD:,.0f}...")
     
     conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     
-    # Get 100 recent trades above threshold
     c.execute('''
         SELECT * FROM trades 
         WHERE amount_usdc >= ?
         ORDER BY timestamp DESC
-        LIMIT 100
+        LIMIT 50
     ''', (FORENSIC_USDC_THRESHOLD,))
     
     rows = c.fetchall()
     conn.close()
     
-    print(f"Found {len(rows)} trades to re-score.")
-    print("-" * 70)
+    print(f"Found {len(rows)} trades to re-score.\n")
     
-    # 2. Initialize forensic components
+    # 2. Initialize components
     w3 = AsyncWeb3(AsyncHTTPProvider(POLYGON_HTTP_URL))
     resolver = AddressResolver(w3)
-    scorer = InsiderScorer()
     repository = TradeRepository(DATABASE_PATH)
+    scorer = InsiderScorer(repository=repository)  # Pass repository for Drip Detection
+    upside_validator = UpsideValidator()
     
     rescored_count = 0
     high_score_count = 0
+    feature_triggers = {
+        "slippage_insensitivity": 0,
+        "low_probability_trigger": 0,
+        "quiet_accumulation": 0,
+    }
     
     for row in rows:
         trade_id = row["id"]
@@ -60,23 +65,32 @@ async def main():
         existing_owner = row["owner_address"]
         ts_str = row["timestamp"]
         asset_id = row["asset_id"]
+        trade_price = row["price"] if "price" in row.keys() else None
         
-        print(f"\nProcessing Trade #{trade_id} (${amount:,.0f})")
+        print("-" * 70)
+        print(f"Trade #{trade_id} | ${amount:,.0f} | Price: {trade_price:.4f}" if trade_price else f"Trade #{trade_id} | ${amount:,.0f} | Price: N/A")
         
         try:
-            # 3. Resolve Owner (using improved logic)
-            # We always re-resolve to catch factories that might have been missed
+            # 3. Resolve Owner
             owner, proxy_type = await resolver.resolve(proxy)
+            owner = owner or proxy
             
-            if owner:
-                print(f"  Owner Resolved: {owner[:10]}... ({proxy_type.name})")
-                # Update owner in DB if changed
-                if owner != existing_owner:
-                    await repository.update_owner(trade_id, owner, proxy_type.name)
-            else:
-                print(f"  Owner: Unknown (using proxy)")
-                
-            # 4. Calculate Score
+            # 4. Get current mid-price and slippage
+            current_price = None
+            slippage_percent = 0.0
+            
+            try:
+                upside_result = await upside_validator.validate(
+                    asset_id=asset_id,
+                    insider_entry_price=None,
+                    side="buy",
+                )
+                current_price = upside_result.current_price
+                slippage_percent = upside_result.slippage_percent or 0.0
+            except Exception:
+                pass  # Order book fetch failed
+            
+            # 5. Calculate Score with ALL new parameters
             ts = datetime.fromisoformat(ts_str)
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
@@ -86,20 +100,16 @@ async def main():
                 trade_timestamp=ts,
                 trade_amount_usdc=amount,
                 asset_id=asset_id,
+                price=trade_price,
+                slippage_percent=slippage_percent,
+                current_mid_price=current_price,
                 proxy_address=proxy,
             )
             
-            # 5. Update Database
-            bridge_funded = False
-            bridge_name = None
-            win_rate = None
-            
-            if score_result.bridge_result:
-                bridge_funded = score_result.bridge_result.is_bridge_funded
-                bridge_name = score_result.bridge_result.bridge_name
-            
-            if score_result.win_rate_result:
-                win_rate = score_result.win_rate_result.win_rate
+            # 6. Update Database
+            bridge_funded = score_result.bridge_result.is_bridge_funded if score_result.bridge_result else False
+            bridge_name = score_result.bridge_result.bridge_name if score_result.bridge_result else None
+            win_rate = score_result.win_rate_result.win_rate if score_result.win_rate_result else None
             
             await repository.update_insider_score(
                 trade_id=trade_id,
@@ -110,24 +120,38 @@ async def main():
                 win_rate=win_rate,
             )
             
-            print(f"  Score: {score_result.score}/100")
-            if score_result.reasons:
-                print(f"  Reasons: {score_result.reasons}")
+            # 7. Display Results
+            icon = "[ALERT]" if score_result.is_alert_worthy else "[SCORE]"
+            print(f"  {icon} Score: {score_result.score}/100+")
+            
+            for reason in score_result.reasons:
+                print(f"    - {reason}")
+            
+            # Track feature triggers
+            for feature in feature_triggers:
+                if feature in score_result.feature_scores:
+                    feature_triggers[feature] += 1
             
             rescored_count += 1
-            if score_result.score >= 70:
+            if score_result.score >= 75:
                 high_score_count += 1
                 
         except Exception as e:
-            print(f"  [ERROR] Failed to score trade #{trade_id}: {e}")
+            print(f"  [ERROR] {e}")
             continue
 
     print("\n" + "=" * 70)
-    print(f"RE-SCORING COMPLETE")
-    print(f"Total Processed: {rescored_count}")
-    print(f"High Score Trades (>=70): {high_score_count}")
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"Trades Rescored: {rescored_count}")
+    print(f"High Score (>=75): {high_score_count}")
+    print(f"\nNew Feature Triggers:")
+    print(f"  Slippage Insensitivity: {feature_triggers['slippage_insensitivity']}")
+    print(f"  Low-Probability Trigger: {feature_triggers['low_probability_trigger']}")
+    print(f"  Drip Detection (Quiet Acc): {feature_triggers['quiet_accumulation']}")
     print("=" * 70)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+

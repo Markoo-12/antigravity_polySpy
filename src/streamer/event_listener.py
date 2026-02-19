@@ -208,6 +208,7 @@ class EventListener:
                 asset_id=parsed.outcome_token_id,
                 side=parsed.side,
                 amount_usdc=parsed.usdc_amount,
+                price=parsed.price,
                 market_id=None,
             )
             

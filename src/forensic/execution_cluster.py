@@ -1,7 +1,7 @@
 """
 Execution Cluster Detector - Immediate alert for rapid coordinated trading.
 
-Detects when 3+ wallets buy the same asset within 120 seconds.
+Detects when 5+ wallets buy the same asset within 120 seconds.
 This triggers an IMMEDIATE alert regardless of individual score.
 
 Part of the Shadow-Whale Forensic Sentinel.
@@ -16,7 +16,7 @@ from ..config import DATABASE_PATH
 
 # Configuration
 EXECUTION_CLUSTER_WINDOW_SECONDS = 120  # 2 minutes
-EXECUTION_CLUSTER_MIN_WALLETS = 3  # Minimum wallets for immediate alert
+EXECUTION_CLUSTER_MIN_WALLETS = 5  # Minimum wallets for immediate alert
 
 
 @dataclass

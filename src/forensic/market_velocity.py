@@ -16,90 +16,92 @@ from ..config import (
 class MarketVelocityResult:
     """Result of market velocity analysis."""
     is_quiet_accumulation: bool
-    trade_volume_share: Optional[float]  # 0.0 to 1.0
-    price_change_1h: Optional[float]  # Percentage
     score_points: int
     analysis_note: str
 
 
 class MarketVelocityAnalyzer:
     """
-    Analyzes if a trade represents significant volume
-    in a market with low recent price movement.
+    Analyzes if a trade represents "Quiet Accumulation".
     
-    This suggests "quiet accumulation" - a potential insider signal
-    where someone is building a large position before a catalyst.
+    Refined Definition (V2.1):
+    - Drip Detection: 3+ separate buys in same market within 6 hours
+      where price remains within 2-cent range.
+    - Legacy "large trade" heuristic REMOVED.
     """
     
-    def __init__(self):
-        pass
+    def __init__(self, repository=None):
+        self.repository = repository
     
     async def check_quiet_accumulation(
         self,
         trade_amount_usdc: float,
         asset_id: str,
-        market_volume_24h: Optional[float] = None,
-        price_change_1h: Optional[float] = None
+        price: Optional[float],
+        owner_address: Optional[str] = None,
     ) -> MarketVelocityResult:
         """
-        Check if the trade exhibits quiet accumulation patterns.
+        Check for Quiet Accumulation (Drip Detection).
         
-        Args:
-            trade_amount_usdc: Size of the trade in USDC
-            asset_id: The outcome token asset ID
-            market_volume_24h: Optional 24h volume (if known)
-            price_change_1h: Optional 1h price change (if known)
-            
-        Returns:
-            MarketVelocityResult with analysis
+        Rule: If wallet makes 3+ separate buys in the same market within 6 hours,
+        and the price remains within a 2-cent range, assign +35 points.
         """
-        # NOTE: Full implementation would require Polymarket API
-        # to fetch real market volume and price data.
-        # For now, we'll use heuristics based on trade size.
+        # We need repository, valid owner, and valid price to run this check
+        if not self.repository or not owner_address or price is None or price <= 0:
+            return MarketVelocityResult(False, 0, "Insufficient data for accumulation check")
         
-        # If we have market data, use it
-        if market_volume_24h is not None and price_change_1h is not None:
-            volume_share = trade_amount_usdc / market_volume_24h if market_volume_24h > 0 else 0
-            
-            is_quiet = (
-                volume_share >= VOLUME_SHARE_THRESHOLD and 
-                abs(price_change_1h) <= PRICE_CHANGE_THRESHOLD
+        return await self._check_drip_detection(owner_address, asset_id, price)
+
+    async def _check_drip_detection(
+        self,
+        owner_address: str,
+        asset_id: str,
+        current_price: float
+    ) -> MarketVelocityResult:
+        """
+        Implement Drip Detection logic.
+        """
+        # Valid price range: +/- 1 cent from current execution price (Total 2 cent range)
+        # OR just check that max_price - min_price <= 0.02 in the window
+        
+        # We'll query last 6 hours of buys for this wallet/asset
+        try:
+            trades = await self.repository.get_recent_wallet_trades(
+                wallet_address=owner_address,
+                minutes=360 # 6 hours
             )
             
-            return MarketVelocityResult(
-                is_quiet_accumulation=is_quiet,
-                trade_volume_share=volume_share,
-                price_change_1h=price_change_1h,
-                score_points=SCORE_QUIET_ACCUMULATION if is_quiet else 0,
-                analysis_note=f"Trade is {volume_share*100:.1f}% of 24h volume, price moved {price_change_1h*100:.2f}%",
-            )
-        
-        # Heuristic fallback: large trades (>$10k) in less active markets
-        # are more likely to be quiet accumulation
-        if trade_amount_usdc >= 10000:
-            return MarketVelocityResult(
-                is_quiet_accumulation=True,
-                trade_volume_share=None,
-                price_change_1h=None,
-                score_points=SCORE_QUIET_ACCUMULATION,
-                analysis_note=f"Large trade (${trade_amount_usdc:,.0f}) - potential quiet accumulation",
-            )
-        
-        return MarketVelocityResult(
-            is_quiet_accumulation=False,
-            trade_volume_share=None,
-            price_change_1h=None,
-            score_points=0,
-            analysis_note="Trade size not significant enough for quiet accumulation",
-        )
-    
-    async def fetch_market_data(self, asset_id: str) -> dict:
-        """
-        Fetch market data from Polymarket API.
-        
-        NOTE: This would require the Polymarket CLOB API.
-        Placeholder for future implementation.
-        """
-        # TODO: Implement Polymarket API integration
-        # API endpoint: https://clob.polymarket.com/markets
-        return {}
+            # Filter for buys of the specific asset
+            relevant_buys = [
+                t for t in trades 
+                if t.asset_id == asset_id and t.side == 'buy' and t.price is not None
+            ]
+            
+            # Need at least 2 previous buys (plus current one makes 3+)
+            # The current trade might not be in DB yet depending on when this runs.
+            # Usually forensic runs BEFORE insert? No, listener inserts THEN calls on_trade.
+            # So current trade SHOULD be in `trades` list.
+            
+            if len(relevant_buys) < 3:
+                return MarketVelocityResult(False, 0, f"Not enough history ({len(relevant_buys)} buys)")
+                
+            # Check price consistency
+            prices = [t.price for t in relevant_buys]
+            min_p = min(prices)
+            max_p = max(prices)
+            range_cents = max_p - min_p
+            
+            # 2 cent range check (0.02)
+            if range_cents <= 0.02:
+                return MarketVelocityResult(
+                    is_quiet_accumulation=True,
+                    score_points=35, # +35 points
+                    analysis_note=f"Drip Detection: {len(relevant_buys)} buys in 6h within ${range_cents:.3f} range"
+                )
+            
+            return MarketVelocityResult(False, 0, f"Prices too volatile (Range: ${range_cents:.3f})")
+            
+        except Exception as e:
+            print(f"[ERROR] Drip detection error: {e}")
+            return MarketVelocityResult(False, 0, "Error checking drip detection")
+

@@ -39,10 +39,13 @@ from src.streamer import EventListener
 from src.streamer.event_parser import ParsedOrderFilled
 from src.demasker import AddressResolver
 from src.forensic import InsiderScorer, ClusterDetector, LateStageSentinel
+from src.forensic.market_resolver import MarketResolver
+from src.forensic.guardrails import GuardrailFilter
 from src.execution import UpsideValidator, ExecutionGuard
 from src.alerts import TelegramAlertBot
-from src.alerts.telegram_bot import AlertData, ClusterAlertData, DumpAlertData
+from src.alerts.telegram_bot import AlertData, ClusterAlertData, DumpAlertData, ConvictionAlertData
 from src.database.repository import Trade
+from src.database.blacklist_repo import BlacklistRepository
 
 
 class InsiderSentinel:
@@ -68,6 +71,7 @@ class InsiderSentinel:
         
         # Core components
         self.repository: Optional[TradeRepository] = None
+        self.blacklist_repository: Optional[BlacklistRepository] = None
         self.listener: Optional[EventListener] = None
         self.resolver: Optional[AddressResolver] = None
         self.scorer: Optional[InsiderScorer] = None
@@ -80,6 +84,8 @@ class InsiderSentinel:
         self.late_stage_sentinel: Optional[LateStageSentinel] = None
         self.execution_guard: Optional[ExecutionGuard] = None
         self.cluster_detector: Optional[ClusterDetector] = None
+        self.market_resolver: Optional[MarketResolver] = None
+        self.guardrail_filter: Optional[GuardrailFilter] = None
     
     async def start(self) -> None:
         """Start the surveillance system."""
@@ -103,24 +109,32 @@ class InsiderSentinel:
         await init_database(self.db_path)
         self.repository = TradeRepository(self.db_path)
         
+        self.blacklist_repository = BlacklistRepository(self.db_path)
+        await self.blacklist_repository.init_table()
+        
+        self.guardrail_filter = GuardrailFilter(self.repository, self.blacklist_repository)
+        
         # Create Web3 connection for resolver
         self._w3 = AsyncWeb3(create_web3_provider(self.wss_url))
         self.resolver = AddressResolver(self._w3)
         
         # Initialize forensic scorer
-        self.scorer = InsiderScorer()
+        self.scorer = InsiderScorer(repository=self.repository)
         
         # Initialize Phase 5 components
         self.upside_validator = UpsideValidator()
         self.late_stage_sentinel = LateStageSentinel()
         self.cluster_detector = ClusterDetector()
+        self.market_resolver = MarketResolver()
         
         # Initialize Telegram bot
         self.telegram = TelegramAlertBot()
         
         # Initialize Execution Guard with dump callback
         self.execution_guard = ExecutionGuard(
+            repository=self.repository,  # Pass repository
             on_dump_detected=self._on_dump_detected,
+            on_conviction_confirmed=self._on_conviction_confirmed,
         )
         
         if self.telegram.is_configured():
@@ -141,6 +155,21 @@ class InsiderSentinel:
         
         # Start listening
         await self.listener.start()
+    
+    async def _on_new_trade(self, trade: Trade, parsed: ParsedOrderFilled) -> None:
+        """
+        Callback when a new trade is detected.
+        Resolves owner, calculates insider score, validates upside, and sends alerts.
+        """
+        # ... (rest of method same as previous, assuming replace is safe if logic is unchanged)
+        # Assuming replace_file_content chunking is mostly smart, but safer to target chunks.
+        # I'll just target the top imports and __init__ and start calls separately if needed.
+        # But here I'm replacing lines 45-144, which is large.
+        # Actually I just need to update imports and `self.execution_guard` init.
+        pass
+
+    # I will simplify the edit to target specific chunks.
+
     
     async def _on_new_trade(self, trade: Trade, parsed: ParsedOrderFilled) -> None:
         """
@@ -177,12 +206,66 @@ class InsiderSentinel:
             proxy_type_value = "error"
             print(f"   [WARN] Error resolving owner ({e}), using proxy address")
         
+            print(f"   [WARN] Error resolving owner ({e}), using proxy address")
+        
+        # --- PHASE 0: BLACKLIST CHECK ---
+        # "The EventListener should check this list first and immediately drop"
+        # We do it here after we have the address (owner or proxy)
+        check_address = owner_address or trade.proxy_address
+        if check_address:
+            is_blocked = await self.blacklist_repository.is_blocked(check_address)
+            if is_blocked:
+                print(f"   [BLOCK] 🚫 Ignoring blocked wallet: {check_address[:10]}...")
+                return
+
+        # --- PHASE 0.5: ANTI-BOT GUARDRAILS ---
+        if check_address and self.guardrail_filter:
+            guard_result = await self.guardrail_filter.check_all(trade, check_address)
+            
+            if guard_result.should_discard:
+                print(f"   [FILTER] [GUARD] Guardrail triggered: {guard_result.reason}")
+                
+                if guard_result.should_blacklist and guard_result.blacklist_type:
+                    # Flag the wallet
+                    await self.blacklist_repository.flag_address(check_address, guard_result.blacklist_type)
+                    
+                return # DROP THE ALERT regardless of score
+
         # Phase 3, 4 & 5: Forensic analysis with Profit-Logic Layer
         # Run analysis if we have owner OR proxy address (proxy works as fallback)
         if trade.amount_usdc >= FORENSIC_USDC_THRESHOLD and self.scorer:
             try:
                 print(f"   [ANALYSIS] Running forensic analysis...")
                 
+                # Phase 5.1: Upside Validation (Check Slippage First)
+                upside_valid = True
+                current_price = None
+                slippage_percent = 0.0
+                score_adjustment_upside = 0
+                
+                if self.upside_validator:
+                    upside_result = await self.upside_validator.validate(
+                        asset_id=trade.asset_id,
+                        insider_entry_price=None,  # We don't know their exact entry
+                        side=trade.side,
+                    )
+                    
+                    upside_valid = upside_result.is_valid
+                    current_price = upside_result.current_price
+                    slippage_percent = upside_result.slippage_percent or 0.0
+                    
+                    # Store score adjustment from upside validator (if any other than slippage?)
+                    # Note: Slippage Penalty is now handled inside Scorer.
+                    # But upside_validator might return other adjustments? 
+                    # Currently upside_validator returns score_adjustment for slippage (-40).
+                    # We should probably ignore that one if we implemented it in Scorer, 
+                    # OR pass it to Scorer.
+                    # The prompt says: "Implement 'Slippage Penalty'... cap score at +15".
+                    # So we should rely on the new Scorer logic for the penalty.
+                    
+                    if not upside_valid:
+                        print(f"   [FILTER] Trade filtered by Upside Validator: {upside_result.rejection_reasons}")
+
                 # Calculate base insider score
                 # Pass proxy_address as fallback for wallet analysis when owner is unknown
                 score_result = await self.scorer.calculate_score(
@@ -190,6 +273,9 @@ class InsiderSentinel:
                     trade_timestamp=trade.timestamp,
                     trade_amount_usdc=trade.amount_usdc,
                     asset_id=trade.asset_id,
+                    price=trade.price,  # NEW: Pass execution price
+                    slippage_percent=slippage_percent, # NEW: Pass slippage
+                    current_mid_price=current_price,  # NEW: Pass mid-price for insensitivity check
                     proxy_address=trade.proxy_address,  # NEW: fallback for wallet analysis
                 )
                 
@@ -207,28 +293,6 @@ class InsiderSentinel:
                         total_score += late_stage_result.score_bonus
                         reasons.append(f"Late-stage pattern: {late_stage_result.reason} [+{late_stage_result.score_bonus}]")
                         print(f"   [LATE-STAGE] +{late_stage_result.score_bonus} points: {late_stage_result.reason}")
-                
-                # Phase 5.1: Upside Validation
-                upside_valid = True
-                current_price = None
-                
-                if self.upside_validator:
-                    upside_result = await self.upside_validator.validate(
-                        asset_id=trade.asset_id,
-                        insider_entry_price=None,  # We don't know their exact entry
-                        side=trade.side,
-                    )
-                    
-                    upside_valid = upside_result.is_valid
-                    current_price = upside_result.current_price
-                    
-                    # Apply slippage penalty
-                    if upside_result.score_adjustment != 0:
-                        total_score += upside_result.score_adjustment
-                        reasons.append(f"Slippage penalty: {upside_result.slippage_percent:.1%} slippage [{upside_result.score_adjustment}]")
-                    
-                    if not upside_valid:
-                        print(f"   [FILTER] Trade filtered by Upside Validator: {upside_result.rejection_reasons}")
                 
                 # Store score in database (even if filtered)
                 bridge_funded = False
@@ -258,6 +322,17 @@ class InsiderSentinel:
                 for reason in reasons:
                     print(f"      - {reason}")
                 
+                # Resolve market info for alerts
+                market_slug = trade.market_id
+                market_outcome = "Yes" if trade.side == "buy" else "No"
+                
+                if self.market_resolver:
+                    market_info = await self.market_resolver.resolve(trade.asset_id)
+                    if market_info.slug:
+                        market_slug = market_info.slug
+                    if market_info.outcome:
+                        market_outcome = market_info.outcome
+
                 # Phase 5.4: Add to Cluster Detector
                 if self.cluster_detector and is_alert_worthy:
                     cluster_alert = self.cluster_detector.add_trade(
@@ -278,13 +353,23 @@ class InsiderSentinel:
                             total_amount_usdc=cluster_alert.total_amount_usdc,
                             avg_score=cluster_alert.avg_score,
                             time_span_seconds=cluster_alert.time_span_seconds,
-                            market_slug=trade.market_id,
-                            outcome="Yes" if trade.side == "buy" else "No",
+                            market_slug=market_slug,
+                            outcome=market_outcome,
                         )
                         await self.telegram.send_cluster_alert(cluster_data)
                 
-                # Phase 4: Send Telegram alert (if passes upside validation)
-                if is_alert_worthy and upside_valid and self.telegram and self.telegram.is_configured():
+                # Phase 5.5: Check Maturity Filter (Silent Discard)
+                is_mature_wallet = True
+                if self.execution_guard and trade.amount_usdc < 100000: # Always trust whales > $100k? Or apply to all?
+                     # Apply Maturity Filter check
+                     # Use proxy address for history check as it's the direct trading entity
+                    is_mature_wallet = await self.execution_guard.validate_alert(
+                        wallet_address=trade.proxy_address,
+                        asset_id=trade.asset_id
+                    )
+                
+                # Phase 4: Send Telegram alert (if passes upside validation AND maturity filter)
+                if is_alert_worthy and upside_valid and is_mature_wallet and self.telegram and self.telegram.is_configured():
                     alert_data = AlertData(
                         insider_score=total_score,
                         trade_amount_usdc=trade.amount_usdc,
@@ -295,8 +380,8 @@ class InsiderSentinel:
                         tx_hash=trade.tx_hash,
                         reasons=reasons,
                         market_id=trade.market_id,
-                        market_slug=trade.market_id,  # Will be resolved to slug if available
-                        outcome="Yes" if trade.side == "buy" else "No",
+                        market_slug=market_slug,
+                        outcome=market_outcome,
                         current_price=current_price,
                     )
                     await self.telegram.send_alert(alert_data)
@@ -333,6 +418,21 @@ class InsiderSentinel:
                 tx_hash=dump_alert.tx_hash,
             )
             await self.telegram.send_dump_warning(dump_data)
+
+    async def _on_conviction_confirmed(self, conviction_alert) -> None:
+        """Callback when Execution Guard confirms a conviction hold."""
+        if self.telegram and self.telegram.is_configured():
+            conviction_data = ConvictionAlertData(
+                wallet_address=conviction_alert.wallet_address,
+                asset_id=conviction_alert.asset_id,
+                initial_shares=conviction_alert.initial_shares,
+                current_shares=conviction_alert.current_shares,
+                trade_amount_usdc=conviction_alert.trade_amount_usdc,
+                minutes_held=conviction_alert.minutes_held,
+                tx_hash=conviction_alert.tx_hash,
+            )
+            await self.telegram.send_conviction_alert(conviction_data)
+
     
     async def stop(self) -> None:
         """Stop the surveillance system gracefully."""

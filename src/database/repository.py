@@ -20,6 +20,7 @@ class Trade:
     asset_id: str
     side: str  # 'buy' or 'sell'
     amount_usdc: float
+    price: Optional[float] = None
     market_id: Optional[str] = None
     id: Optional[int] = None
 
@@ -42,8 +43,8 @@ class TradeRepository:
                     INSERT INTO trades (
                         tx_hash, block_number, timestamp, order_hash, 
                         proxy_address, owner_address, proxy_type, 
-                        asset_id, side, amount_usdc, market_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        asset_id, side, amount_usdc, price, market_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         trade.tx_hash,
@@ -53,9 +54,11 @@ class TradeRepository:
                         trade.proxy_address,
                         trade.owner_address,
                         trade.proxy_type,
+                        trade.proxy_type,
                         trade.asset_id,
                         trade.side,
                         trade.amount_usdc,
+                        trade.price,
                         trade.market_id,
                     ),
                 )
@@ -172,6 +175,7 @@ class TradeRepository:
             asset_id=row["asset_id"],
             side=row["side"],
             amount_usdc=row["amount_usdc"],
+            price=row["price"] if "price" in row.keys() else None,
             market_id=row["market_id"],
         )
     
@@ -227,3 +231,116 @@ class TradeRepository:
         """Reclaim disk space after deletions."""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("VACUUM")
+
+    async def check_flipping_activity(self, proxy_address: str, asset_id: str, minutes: int = 30) -> bool:
+        """
+        Check if wallet has bought and sold the same asset within the time window.
+        Returns True if flipping detected (buy -> sell or sell -> buy < minutes).
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            # Check for ANY trade of opposite side for same asset in time window
+            # We look for trades in the last X minutes
+            cursor = await db.execute(
+                """
+                SELECT COUNT(*) FROM trades 
+                WHERE proxy_address = ? 
+                AND asset_id = ? 
+                AND timestamp >= datetime('now', ?)
+                """,
+                (proxy_address, asset_id, f'-{minutes} minutes')
+            )
+            count = (await cursor.fetchone())[0]
+            # If count > 1, it means we have multiple trades (flipping or accumulation)
+            # To be precise, we should check if they are opposite sides.
+            # But checking > 1 trade in 30 mins for same asset is already suspicious "Active Trading"
+            # The prompt says "buying and selling".
+            
+            if count > 1:
+                # Check effectively for distinct sides
+                cursor = await db.execute(
+                    """
+                    SELECT COUNT(DISTINCT side) FROM trades 
+                    WHERE proxy_address = ? 
+                    AND asset_id = ? 
+                    AND timestamp >= datetime('now', ?)
+                    """,
+                    (proxy_address, asset_id, f'-{minutes} minutes')
+                )
+                sides = (await cursor.fetchone())[0]
+                return sides > 1  # True if both BUY and SELL found
+            
+            return False
+
+    async def get_position_hold_time(self, proxy_address: str, asset_id: str) -> float:
+        """
+        Get the duration (in minutes) the wallet has held the position.
+        Returns minutes since first BUY. Returns 0 if no Buys found.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                SELECT MIN(timestamp) FROM trades 
+                WHERE proxy_address = ? 
+                AND asset_id = ? 
+                AND side = 'buy'
+                """,
+                (proxy_address, asset_id)
+            )
+            row = await cursor.fetchone()
+            if not row or not row[0]:
+                return 0.0
+                
+            first_buy = datetime.fromisoformat(row[0])
+            now = datetime.utcnow() # Assuming DB timestamps are UTC
+            
+            delta = now - first_buy
+            return delta.total_seconds() / 60.0
+
+    async def get_lifetime_volume(self, wallet_address: str) -> float:
+        """Get total volume traded by a wallet."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                SELECT SUM(amount_usdc) FROM trades 
+                WHERE proxy_address = ? OR owner_address = ?
+                """,
+                (wallet_address, wallet_address)
+            )
+            row = await cursor.fetchone()
+            return row[0] if row and row[0] else 0.0
+
+    async def get_max_position_value(self, wallet_address: str) -> float:
+        """
+        Get the maximum single position value held by a wallet.
+        Approximated by the largest single BUY order for now, 
+        or we could sum up buys per asset. 
+        For 'Max Position Held', largest BUY is a safe lower bound proxy.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                SELECT MAX(amount_usdc) FROM trades 
+                WHERE (proxy_address = ? OR owner_address = ?)
+                AND side = 'buy'
+                """,
+                (wallet_address, wallet_address)
+            )
+            row = await cursor.fetchone()
+            return row[0] if row and row[0] else 0.0
+
+    async def get_recent_wallet_trades(self, wallet_address: str, minutes: int = 10) -> List[Trade]:
+        """Get recent trades for a wallet to check for symmetric moves."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT * FROM trades 
+                WHERE (proxy_address = ? OR owner_address = ?)
+                AND timestamp >= datetime('now', ?)
+                ORDER BY timestamp DESC
+                """,
+                (wallet_address, wallet_address, f'-{minutes} minutes')
+            )
+            rows = await cursor.fetchall()
+            return [self._row_to_trade(row) for row in rows]
+
