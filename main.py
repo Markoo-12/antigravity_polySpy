@@ -47,6 +47,7 @@ from src.alerts.telegram_bot import AlertData, ClusterAlertData, DumpAlertData, 
 from src.database.repository import Trade
 from src.database.blacklist_repo import BlacklistRepository
 from src.profitability import SignalTracker, PaperTrader
+from src.ml import MomentumFeatureExtractor, MomentumFilter
 from src.config import (
     PAPER_TRADE_POSITION_SIZE,
     PAPER_TRADE_SLIPPAGE_PCT,
@@ -98,6 +99,10 @@ class InsiderSentinel:
         # Phase 6: Profitability Tracking
         self.signal_tracker: Optional[SignalTracker] = None
         self.paper_trader: Optional[PaperTrader] = None
+        
+        # Phase 7: ML Momentum Filter
+        self.momentum_filter: Optional[MomentumFilter] = None
+        self.feature_extractor: Optional[MomentumFeatureExtractor] = None
     
     async def start(self) -> None:
         """Start the surveillance system."""
@@ -165,6 +170,14 @@ class InsiderSentinel:
             check_interval=SIGNAL_CHECK_INTERVAL,
         )
         await self.paper_trader.init()
+        
+        # Phase 7: ML Momentum Filter
+        self.momentum_filter = MomentumFilter()
+        self.feature_extractor = MomentumFeatureExtractor(self.repository)
+        if self.momentum_filter.is_loaded:
+            print("[ML] Momentum Ignition Filter: ACTIVE")
+        else:
+            print("[ML] Momentum Ignition Filter: PASS-THROUGH (no trained model)")
         
         if self.telegram.is_configured():
             print("[TELEGRAM] Telegram alerts enabled")
@@ -334,6 +347,22 @@ class InsiderSentinel:
                 
                 # Print score summary
                 is_alert_worthy = total_score >= INSIDER_ALERT_THRESHOLD
+                
+                # Phase 7: ML Momentum Ignition Filter
+                if is_alert_worthy and self.momentum_filter and self.feature_extractor:
+                    try:
+                        ml_features = await self.feature_extractor.extract(
+                            trade=trade, owner_address=owner_address
+                        )
+                        toxic_prob, ml_label = self.momentum_filter.predict(ml_features)
+                        if ml_label == "MOMENTUM_TRAP":
+                            print(f"   [ML] MOMENTUM TRAP AVOIDED (toxic_prob={toxic_prob:.2f})")
+                            is_alert_worthy = False  # Block the alert
+                        elif ml_label != "NO_MODEL":
+                            print(f"   [ML] Passed filter (toxic_prob={toxic_prob:.2f})")
+                    except Exception as e:
+                        print(f"   [ML] Filter error: {e} — allowing trade through")
+                
                 icon = "[ALERT]" if is_alert_worthy else "[SCORE]"
                 print(f"   {icon} Insider Score: {total_score}/100+")
                 for reason in reasons:
