@@ -46,6 +46,14 @@ from src.alerts import TelegramAlertBot
 from src.alerts.telegram_bot import AlertData, ClusterAlertData, DumpAlertData, ConvictionAlertData
 from src.database.repository import Trade
 from src.database.blacklist_repo import BlacklistRepository
+from src.profitability import SignalTracker, PaperTrader
+from src.config import (
+    PAPER_TRADE_POSITION_SIZE,
+    PAPER_TRADE_SLIPPAGE_PCT,
+    PAPER_TRADE_FEE_PCT,
+    PAPER_TRADE_TIMEOUT_DAYS,
+    SIGNAL_CHECK_INTERVAL,
+)
 
 
 class InsiderSentinel:
@@ -86,6 +94,10 @@ class InsiderSentinel:
         self.cluster_detector: Optional[ClusterDetector] = None
         self.market_resolver: Optional[MarketResolver] = None
         self.guardrail_filter: Optional[GuardrailFilter] = None
+        
+        # Phase 6: Profitability Tracking
+        self.signal_tracker: Optional[SignalTracker] = None
+        self.paper_trader: Optional[PaperTrader] = None
     
     async def start(self) -> None:
         """Start the surveillance system."""
@@ -137,6 +149,23 @@ class InsiderSentinel:
             on_conviction_confirmed=self._on_conviction_confirmed,
         )
         
+        # Phase 6: Profitability Tracking
+        self.signal_tracker = SignalTracker(
+            db_path=self.db_path,
+            check_interval=SIGNAL_CHECK_INTERVAL,
+        )
+        await self.signal_tracker.init()
+        
+        self.paper_trader = PaperTrader(
+            db_path=self.db_path,
+            position_size=PAPER_TRADE_POSITION_SIZE,
+            slippage_pct=PAPER_TRADE_SLIPPAGE_PCT,
+            fee_pct=PAPER_TRADE_FEE_PCT,
+            timeout_days=PAPER_TRADE_TIMEOUT_DAYS,
+            check_interval=SIGNAL_CHECK_INTERVAL,
+        )
+        await self.paper_trader.init()
+        
         if self.telegram.is_configured():
             print("[TELEGRAM] Telegram alerts enabled")
         else:
@@ -144,6 +173,10 @@ class InsiderSentinel:
         
         # Start Execution Guard background task
         await self.execution_guard.start()
+        
+        # Start profitability background checkers
+        await self.signal_tracker.start_checker()
+        await self.paper_trader.start_checker()
         
         # Create event listener with callback
         self.listener = EventListener(
@@ -156,20 +189,6 @@ class InsiderSentinel:
         # Start listening
         await self.listener.start()
     
-    async def _on_new_trade(self, trade: Trade, parsed: ParsedOrderFilled) -> None:
-        """
-        Callback when a new trade is detected.
-        Resolves owner, calculates insider score, validates upside, and sends alerts.
-        """
-        # ... (rest of method same as previous, assuming replace is safe if logic is unchanged)
-        # Assuming replace_file_content chunking is mostly smart, but safer to target chunks.
-        # I'll just target the top imports and __init__ and start calls separately if needed.
-        # But here I'm replacing lines 45-144, which is large.
-        # Actually I just need to update imports and `self.execution_guard` init.
-        pass
-
-    # I will simplify the edit to target specific chunks.
-
     
     async def _on_new_trade(self, trade: Trade, parsed: ParsedOrderFilled) -> None:
         """
@@ -206,8 +225,6 @@ class InsiderSentinel:
             proxy_type_value = "error"
             print(f"   [WARN] Error resolving owner ({e}), using proxy address")
         
-            print(f"   [WARN] Error resolving owner ({e}), using proxy address")
-        
         # --- PHASE 0: BLACKLIST CHECK ---
         # "The EventListener should check this list first and immediately drop"
         # We do it here after we have the address (owner or proxy)
@@ -215,7 +232,7 @@ class InsiderSentinel:
         if check_address:
             is_blocked = await self.blacklist_repository.is_blocked(check_address)
             if is_blocked:
-                print(f"   [BLOCK] 🚫 Ignoring blocked wallet: {check_address[:10]}...")
+                print(f"   [BLOCK] Ignoring blocked wallet: {check_address[:10]}...")
                 return
 
         # --- PHASE 0.5: ANTI-BOT GUARDRAILS ---
@@ -386,6 +403,31 @@ class InsiderSentinel:
                     )
                     await self.telegram.send_alert(alert_data)
                     
+                    # Phase 6: Record signal and open paper trade
+                    if self.signal_tracker:
+                        signal_id = await self.signal_tracker.record_signal(
+                            trade_id=trade.id,
+                            asset_id=trade.asset_id,
+                            side=trade.side,
+                            insider_score=total_score,
+                            entry_price=current_price or trade.price or 0.5,
+                            alert_timestamp=trade.timestamp,
+                            market_slug=market_slug,
+                            owner_address=owner_address,
+                            trade_amount_usdc=trade.amount_usdc,
+                        )
+                        
+                        # Open paper trade for this signal
+                        if self.paper_trader:
+                            await self.paper_trader.open_position(
+                                asset_id=trade.asset_id,
+                                entry_price=current_price or trade.price or 0.5,
+                                side=trade.side,
+                                insider_score=total_score,
+                                signal_id=signal_id,
+                                market_slug=market_slug,
+                            )
+                    
                     # Phase 5.3: Start Execution Guard monitoring
                     if self.execution_guard and trade.side == "buy":
                         # Estimate shares from USDC amount and price
@@ -443,6 +485,12 @@ class InsiderSentinel:
         
         if self.execution_guard:
             await self.execution_guard.stop()
+        
+        if self.signal_tracker:
+            await self.signal_tracker.stop_checker()
+        
+        if self.paper_trader:
+            await self.paper_trader.stop_checker()
         
         # Print summary
         if self.repository:
@@ -587,6 +635,16 @@ async def main() -> None:
             # Cleanup mode: python main.py --cleanup [days]
             days = int(sys.argv[2]) if len(sys.argv) > 2 else DATA_RETENTION_DAYS
             await sentinel.cleanup_database(days)
+            return
+        elif sys.argv[1] == "--profit-report":
+            # Profitability report mode
+            from src.profitability import SignalTracker, PaperTrader
+            tracker = SignalTracker(db_path=DATABASE_PATH)
+            await tracker.init()
+            trader = PaperTrader(db_path=DATABASE_PATH)
+            await trader.init()
+            print(await tracker.get_report())
+            print(await trader.get_report())
             return
     
     # Normal streaming mode

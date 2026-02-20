@@ -156,7 +156,7 @@ class EventParser:
             )
             
         except Exception as e:
-            print(f"❌ Failed to parse OrderFilled event: {e}")
+            print(f"[ERR] Failed to parse OrderFilled event: {e}")
             return None
     
     def _extract_address(self, topic: bytes | str) -> str:
@@ -171,7 +171,7 @@ class EventParser:
     
     def format_trade_summary(self, event: ParsedOrderFilled) -> str:
         """Format a human-readable trade summary."""
-        side_emoji = "🟢" if event.side == "buy" else "🔴"
+        side_emoji = "[BUY]" if event.side == "buy" else "[SELL]"
         return (
             f"{side_emoji} {event.side.upper()} | "
             f"${event.usdc_amount:,.2f} USDC | "

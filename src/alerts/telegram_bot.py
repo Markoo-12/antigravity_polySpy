@@ -135,16 +135,16 @@ class TelegramAlertBot:
     def _format_conviction_alert(self, conviction: ConvictionAlertData) -> str:
         """Format a conviction alert."""
         message = f"""
-🚨💎 *TRUE WHALE - CONVICTION CONFIRMED*
+🐳💪 *TRUE WHALE \u2014 CONVICTION CONFIRMED*
 
-✅ Wallet held position for *{conviction.minutes_held} minutes* without selling!
+⏳ Wallet held position for *{conviction.minutes_held} minutes* without selling!
 
 💰 *Amount:* ${conviction.trade_amount_usdc:,.2f} USDC
-📈 *Shares:* {conviction.current_shares:,.0f} (No sales detected)
+🎫 *Shares:* {conviction.current_shares:,.0f} (No sales detected)
 
 👛 *Wallet:* `{conviction.wallet_address[:8]}...{conviction.wallet_address[-6:]}`
 
-🎯 *Verdict:* INFORMED ACCUMULATOR. This is a high-quality signal.
+✅ *Verdict:* INFORMED ACCUMULATOR. High-quality signal!
 
 🔗 [View Transaction](https://polygonscan.com/tx/{conviction.tx_hash})
 """
@@ -179,12 +179,12 @@ class TelegramAlertBot:
         polygonscan_link = f"https://polygonscan.com/tx/{alert.tx_hash}"
         
         # Format reasons
-        reasons_text = "\n".join([f"  • {r}" for r in alert.reasons]) if alert.reasons else "  • No specific flags"
+        reasons_text = "\n".join([f"  \u2022 {r}" for r in alert.reasons]) if alert.reasons else "  \u2022 No specific flags"
         
         # Price info
         price_info = ""
         if alert.current_price is not None:
-            price_info = f"\n💰 *Current Price:* {alert.current_price:.0%}"
+            price_info = f"\n📊 *Current Price:* {alert.current_price:.0%}"
         
         message = f"""
 {emoji} *INSIDER ALERT* (Score: {alert.insider_score}/100)
@@ -193,48 +193,48 @@ class TelegramAlertBot:
 
 👛 *Wallet:* `{alert.owner_address[:8]}...{alert.owner_address[-6:]}`
 
-📊 *Reasons:*
+🔍 *Reasons:*
 {reasons_text}
 
 🔗 *Links:*
-  • [Polymarket]({market_link})
-  • [Arkham Intelligence]({arkham_link})
-  • [Transaction]({polygonscan_link})
+  \u2022 [Polymarket]({market_link})
+  \u2022 [Arkham Intelligence]({arkham_link})
+  \u2022 [Transaction]({polygonscan_link})
 """
         return message.strip()
     
     def _format_cluster_alert(self, cluster: ClusterAlertData) -> str:
         """Format a conviction cluster alert."""
-        wallet_list = "\n".join([f"  • `{w[:8]}...{w[-6:]}`" for w in cluster.wallets[:5]])
+        wallet_list = "\n".join([f"  \u2022 `{w[:8]}...{w[-6:]}`" for w in cluster.wallets[:5]])
         if len(cluster.wallets) > 5:
-            wallet_list += f"\n  • ...and {len(cluster.wallets) - 5} more"
+            wallet_list += f"\n  \u2022 ...and {len(cluster.wallets) - 5} more"
         
         message = f"""
-🚨🚨🚨 *CONVICTION CLUSTER DETECTED*
+🟡🟡🟡 *CONVICTION CLUSTER DETECTED*
 
-⚡ *{len(cluster.wallets)} wallets* entered the same position in {cluster.time_span_seconds}s!
+🔄 *{len(cluster.wallets)} wallets* entered the same position in {cluster.time_span_seconds}s!
 
-💰 *Combined Volume:* ${cluster.total_amount_usdc:,.2f} USDC
-📊 *Average Score:* {cluster.avg_score:.0f}/100
+💵 *Combined Volume:* ${cluster.total_amount_usdc:,.2f} USDC
+🎯 *Average Score:* {cluster.avg_score:.0f}/100
 
 👛 *Wallets:*
 {wallet_list}
 
-⚠️ This is the *highest quality* insider signal!
+⭐ This is the *highest quality* insider signal!
 """
         return message.strip()
     
     def _format_dump_warning(self, dump: DumpAlertData) -> str:
         """Format a manipulation warning alert."""
         message = f"""
-⚠️⚠️⚠️ *MANIPULATION WARNING*
+⚠️⚠️ *MANIPULATION WARNING*
 
-🔴 Whale sold *{dump.dump_percent:.0%}* of position within {dump.minutes_after_buy} minutes!
+📉 Whale sold *{dump.dump_percent:.0%}* of position within {dump.minutes_after_buy} minutes!
 
 👛 *Wallet:* `{dump.wallet_address[:8]}...{dump.wallet_address[-6:]}`
-📉 *Sold:* {dump.sold_shares:,.0f} shares of {dump.initial_shares:,.0f}
+💫 *Sold:* {dump.sold_shares:,.0f} shares of {dump.initial_shares:,.0f}
 
-🚫 *DO NOT FOLLOW* - Possible pump-and-dump detected!
+🚫 *DO NOT FOLLOW* \u2014 Possible pump-and-dump detected!
 
 🔗 [View Transaction](https://polygonscan.com/tx/{dump.tx_hash})
 """
@@ -256,17 +256,17 @@ class TelegramAlertBot:
             "inline_keyboard": [
                 [
                     {
-                        "text": "🚀 EXECUTE TRADE",
+                        "text": "⚡ EXECUTE TRADE",
                         "url": execution_url,
                     }
                 ],
                 [
                     {
-                        "text": "🔍 View Wallet",
+                        "text": "🔍 Wallet",
                         "url": f"https://platform.arkhamintelligence.com/explorer/address/{alert.owner_address}",
                     },
                     {
-                        "text": "📜 View TX",
+                        "text": "📝 TX",
                         "url": f"https://polygonscan.com/tx/{alert.tx_hash}",
                     }
                 ]
@@ -290,7 +290,7 @@ class TelegramAlertBot:
             "inline_keyboard": [
                 [
                     {
-                        "text": "🚀🚀 HIGH-CONVICTION TRADE",
+                        "text": "💪 HIGH-CONVICTION TRADE",
                         "url": execution_url,
                     }
                 ]
@@ -333,7 +333,7 @@ class TelegramAlertBot:
     async def send_test_message(self) -> bool:
         """Send a test message to verify bot configuration."""
         test_msg = """
-🧪 *Polymarket Insider Sentinel - Test Alert*
+🕵️ *Polymarket Insider Sentinel \u2014 Test Alert*
 
 ✅ Bot is configured correctly!
 

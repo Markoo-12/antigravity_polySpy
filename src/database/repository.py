@@ -54,7 +54,6 @@ class TradeRepository:
                         trade.proxy_address,
                         trade.owner_address,
                         trade.proxy_type,
-                        trade.proxy_type,
                         trade.asset_id,
                         trade.side,
                         trade.amount_usdc,
@@ -311,17 +310,21 @@ class TradeRepository:
 
     async def get_max_position_value(self, wallet_address: str) -> float:
         """
-        Get the maximum single position value held by a wallet.
-        Approximated by the largest single BUY order for now, 
-        or we could sum up buys per asset. 
-        For 'Max Position Held', largest BUY is a safe lower bound proxy.
+        Get the maximum cumulative position value held by a wallet.
+        Sums all BUY orders per asset_id and returns the largest
+        per-asset total, giving a more accurate estimate of max
+        position held than a single-order max.
         """
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 """
-                SELECT MAX(amount_usdc) FROM trades 
-                WHERE (proxy_address = ? OR owner_address = ?)
-                AND side = 'buy'
+                SELECT MAX(asset_total) FROM (
+                    SELECT asset_id, SUM(amount_usdc) AS asset_total
+                    FROM trades
+                    WHERE (proxy_address = ? OR owner_address = ?)
+                    AND side = 'buy'
+                    GROUP BY asset_id
+                )
                 """,
                 (wallet_address, wallet_address)
             )

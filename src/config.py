@@ -177,4 +177,15 @@ PRICE_GAIN_THRESHOLD = 0.10  # 10% gain = true positive for buys
 PRICE_DECLINE_THRESHOLD = -0.05  # 5% decline = true positive for sells
 VALIDATION_WINDOW_HOURS = 24  # Check price N hours after trade
 
+# =============================================================================
+# PROFITABILITY TESTING
+# =============================================================================
+
+# Paper Trading
+PAPER_TRADE_POSITION_SIZE = float(os.getenv("PAPER_TRADE_POSITION_SIZE", "2000"))  # $2,000 per signal
+PAPER_TRADE_SLIPPAGE_PCT = 0.015   # 1.5% average slippage
+PAPER_TRADE_FEE_PCT = 0.005        # 0.5% fee
+PAPER_TRADE_TIMEOUT_DAYS = 30      # Auto-close after 30 days
+SIGNAL_CHECK_INTERVAL = 900        # Check pending signals every 15 min (seconds)
+
 

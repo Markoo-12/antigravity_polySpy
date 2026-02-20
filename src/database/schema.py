@@ -39,19 +39,17 @@ CREATE INDEX IF NOT EXISTS idx_trades_block ON trades(block_number);
 CREATE INDEX IF NOT EXISTS idx_trades_insider_score ON trades(insider_score);
 """
 
-# Migration to add new columns to existing tables
-MIGRATION_SQL = """
--- Add Phase 3 columns if they don't exist
-ALTER TABLE trades ADD COLUMN insider_score INTEGER DEFAULT 0;
-ALTER TABLE trades ADD COLUMN score_reasons TEXT;
-ALTER TABLE trades ADD COLUMN bridge_funded BOOLEAN DEFAULT 0;
-ALTER TABLE trades ADD COLUMN bridge_name TEXT;
-ALTER TABLE trades ADD COLUMN win_rate REAL;
-ALTER TABLE trades ADD COLUMN analyzed_at DATETIME;
-
--- Phase 5.x: Add price column
-ALTER TABLE trades ADD COLUMN price REAL;
-"""
+# Migrations: individual ALTER TABLE statements for existing databases
+MIGRATIONS = [
+    "ALTER TABLE trades ADD COLUMN insider_score INTEGER DEFAULT 0",
+    "ALTER TABLE trades ADD COLUMN score_reasons TEXT",
+    "ALTER TABLE trades ADD COLUMN bridge_funded BOOLEAN DEFAULT 0",
+    "ALTER TABLE trades ADD COLUMN bridge_name TEXT",
+    "ALTER TABLE trades ADD COLUMN win_rate REAL",
+    "ALTER TABLE trades ADD COLUMN analyzed_at DATETIME",
+    "ALTER TABLE trades ADD COLUMN price REAL",
+    "ALTER TABLE trades ADD COLUMN market_id TEXT",
+]
 
 
 async def init_database(db_path: str) -> None:
@@ -74,4 +72,14 @@ async def init_database(db_path: str) -> None:
         
         await db.executescript(SCHEMA_SQL)
         await db.commit()
+        
+        # Run migrations for existing databases (adds missing columns)
+        for stmt in MIGRATIONS:
+            try:
+                await db.execute(stmt)
+                await db.commit()
+            except Exception:
+                pass  # Column already exists, skip
+        
         print(f"[OK] Database initialized at {db_path} (WAL mode enabled)")
+
