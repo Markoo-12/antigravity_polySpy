@@ -108,26 +108,33 @@ class WinRateAnalyzer:
                 to_addr = transfer.get("to", "").lower()
                 from_addr = transfer.get("from", "").lower()
                 
-                # Track token movements
-                if token_id not in positions:
-                    positions[token_id] = {"received": 0, "sent": 0}
+                # Track token movements by counterparty
+                # Received FROM CTF Exchange = bought position
+                # Sent TO CTF Exchange = redemption at resolution (WIN)
+                ctf_addr = CTF_EXCHANGE_ADDRESS.lower()
+                wallet_addr = owner_address.lower()
                 
-                if to_addr == owner_address.lower():
-                    positions[token_id]["received"] += amount
-                elif from_addr == owner_address.lower():
-                    positions[token_id]["sent"] += amount
+                if token_id not in positions:
+                    positions[token_id] = {"received_from_exchange": 0, "sent_to_exchange": 0}
+                
+                if to_addr == wallet_addr and from_addr == ctf_addr:
+                    # Received FROM exchange = bought tokens
+                    positions[token_id]["received_from_exchange"] += amount
+                elif from_addr == wallet_addr and to_addr == ctf_addr:
+                    # Sent TO exchange = redemption (win)
+                    positions[token_id]["sent_to_exchange"] += amount
             
             # Analyze positions
-            total_positions = len(positions)
+            total_positions = 0
             winning_positions = 0
             
             for token_id, data in positions.items():
-                # Heuristic: if sent back to exchange (likely redemption), count as closed
-                if data["sent"] > 0:
-                    # If received > initial position, likely a win
-                    if data["received"] > 0:
-                        total_volume += data["received"] / 1e6  # USDC has 6 decimals
-                        # Assume profitable if position was closed
+                # Only count tokens that were received from exchange (actual positions)
+                if data["received_from_exchange"] > 0:
+                    total_positions += 1
+                    total_volume += data["received_from_exchange"] / 1e6  # USDC has 6 decimals
+                    # Win = tokens were redeemed back to the exchange
+                    if data["sent_to_exchange"] > 0:
                         winning_positions += 1
             
             # Calculate win rate

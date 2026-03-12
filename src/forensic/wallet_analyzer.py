@@ -262,8 +262,8 @@ class WalletAnalyzer:
                             if token_id:
                                 token_ids.add(token_id)
                         
-                        # Maduro Rule: Only 1-2 token IDs and current is one of them
-                        if len(token_ids) <= 2 and current_asset_id in token_ids:
+                        # Maduro Rule: Exactly 1 token ID and it IS the current asset
+                        if len(token_ids) == 1 and current_asset_id in token_ids:
                             return True
                     
                     return False

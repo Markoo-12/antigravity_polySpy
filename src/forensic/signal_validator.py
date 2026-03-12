@@ -174,8 +174,23 @@ async def validate_signals(
     
     precision = true_positives / total_predicted if total_predicted > 0 else 0.0
     
-    # Recall requires knowing total actual positives (we approximate)
-    recall = precision  # Simplified: assume we only see predicted positives
+    # Approximate recall: true positives / total trades in the same time window
+    total_trades_in_window = 0
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM trades WHERE timestamp >= ? AND timestamp <= ?",
+                (
+                    cutoff.isoformat(),
+                    (datetime.now(timezone.utc) - timedelta(hours=VALIDATION_WINDOW_HOURS)).isoformat(),
+                ),
+            )
+            row = await cursor.fetchone()
+            total_trades_in_window = row[0] if row else 0
+    except Exception as e:
+        print(f"[VALIDATOR] Error querying total trades for recall: {e}")
+        total_trades_in_window = 0
+    recall = true_positives / max(total_trades_in_window, 1)
     
     # F1 Score
     f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
